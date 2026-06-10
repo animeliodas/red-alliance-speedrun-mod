@@ -33,8 +33,19 @@ namespace RedAllianceSpeedrun
         private ConfigEntry<bool> _consoleLogLeakFix;
         private ConfigEntry<bool> _aggressiveGcOnLoad;
         private ConfigEntry<bool> _disposeOrphanSteamCallbacks;
+        private ConfigEntry<bool> _deltaOnReload;
 
         private bool _devConsoleUnsubscribed;
+
+        // Previous-restart census snapshots, for the auto-delta leak logger. Each restart we
+        // census component-type counts and DDOL-root component counts, then log only what GREW
+        // since the previous restart. A type that climbs by a constant amount every restart is
+        // a leak (object created without the matching destroy). Avoids manual F12 diffing.
+        private Dictionary<string, int> _prevCompCounts;
+        private Dictionary<string, int> _prevDdolCounts;
+        private int _prevTotalGO = -1;
+        private int _prevTotalComp = -1;
+        private int _deltaSampleCount;
 
         // Cached references to current NetworkManager's Steam callbacks. We hold these alive
         // ourselves to prevent finalizer races, and Dispose them explicitly when a new
@@ -107,6 +118,12 @@ namespace RedAllianceSpeedrun
             _diagOnReload = Config.Bind(
                 "Diagnostics", "LogOnLevelLoad", true,
                 "Log RT/material/audio/DDOL counts after every scene load.");
+            _deltaOnReload = Config.Bind(
+                "Diagnostics", "DeltaOnLevelLoad", true,
+                "After each gameplay scene load, census component-type counts + DDOL-root component " +
+                "counts and log ONLY what GREW since the previous restart ([delta] lines). A type that " +
+                "climbs by a constant amount every restart is a leak. Removes need for manual F12 diffing. " +
+                "Adds one full-object census per load (~deep-diag cost); set false to disable.");
             _restartInMenu = Config.Bind(
                 "Hotkeys", "RestartInMenu", false,
                 "If false, the restart key is ignored when the active scene is main_menu, credits, or start_screen.");
@@ -272,6 +289,128 @@ namespace RedAllianceSpeedrun
             {
                 LogDiagnostics("post-load:" + scene.name);
             }
+
+            if (!earlyScene && _deltaOnReload != null && _deltaOnReload.Value)
+            {
+                StartCoroutine(DeltaAfterLoad(scene.name));
+            }
+        }
+
+        // Wait for the scene to fully settle (past the load-spike burst), then census and log
+        // per-restart growth. Delayed enough that pooled objects are re-parented and Start() ran.
+        private IEnumerator DeltaAfterLoad(string sceneName)
+        {
+            for (int i = 0; i < 30; i++) yield return null;
+            LogRestartDelta(sceneName);
+        }
+
+        // Census component-type counts + DDOL-root component counts, then log only entries that
+        // grew vs the previous restart. Constant per-restart growth == a leak. Heavy (one full
+        // FindObjectsOfTypeAll<Component> walk) but runs once per load.
+        private void LogRestartDelta(string tag)
+        {
+            try
+            {
+                // Component-type census.
+                var compCounts = new Dictionary<string, int>(1024);
+                var allComps = Resources.FindObjectsOfTypeAll<Component>();
+                int totalComp = 0;
+                for (int i = 0; i < allComps.Length; i++)
+                {
+                    var c = allComps[i];
+                    if (c == null) continue;
+                    totalComp++;
+                    var n = c.GetType().Name;
+                    int v;
+                    compCounts.TryGetValue(n, out v);
+                    compCounts[n] = v + 1;
+                }
+                int totalGO = Resources.FindObjectsOfTypeAll<GameObject>().Length;
+
+                // DDOL-root component-count census (Object_Pool, _NetworkManager, etc.).
+                var ddolCounts = DontDestroyOnLoadRootCounts();
+
+                if (_prevCompCounts == null)
+                {
+                    Logger.LogMessage(
+                        $"[delta {tag}] baseline #{_deltaSampleCount}: GO={totalGO} Comp={totalComp} " +
+                        $"ddolRoots={ddolCounts.Count}. Restart again to see growth.");
+                }
+                else
+                {
+                    int dGO = totalGO - _prevTotalGO;
+                    int dComp = totalComp - _prevTotalComp;
+
+                    // Grown component types, by descending delta.
+                    var grown = new List<KeyValuePair<string, int>>();
+                    foreach (var kv in compCounts)
+                    {
+                        int prev;
+                        _prevCompCounts.TryGetValue(kv.Key, out prev);
+                        int d = kv.Value - prev;
+                        if (d > 0) grown.Add(new KeyValuePair<string, int>(kv.Key, d));
+                    }
+                    grown.Sort((a, b) => b.Value.CompareTo(a.Value));
+
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append($"[delta {tag} #{_deltaSampleCount}] dGO={dGO:+#;-#;0} dComp={dComp:+#;-#;0}  grownTypes: ");
+                    if (grown.Count == 0) sb.Append("(none)");
+                    int top = Math.Min(15, grown.Count);
+                    for (int i = 0; i < top; i++)
+                    {
+                        if (i > 0) sb.Append(", ");
+                        sb.Append(grown[i].Key).Append("+").Append(grown[i].Value);
+                    }
+                    Logger.LogMessage(sb.ToString());
+
+                    // Grown DDOL roots.
+                    var ddolGrown = new List<string>();
+                    foreach (var kv in ddolCounts)
+                    {
+                        int prev;
+                        _prevDdolCounts.TryGetValue(kv.Key, out prev);
+                        int d = kv.Value - prev;
+                        if (d != 0) ddolGrown.Add($"{kv.Key}{d:+#;-#;0}(now {kv.Value})");
+                    }
+                    Logger.LogMessage("[delta " + tag + " #" + _deltaSampleCount + "] ddolRootDelta: " +
+                        (ddolGrown.Count == 0 ? "(none)" : string.Join(", ", ddolGrown.ToArray())));
+                }
+
+                _prevCompCounts = compCounts;
+                _prevDdolCounts = ddolCounts;
+                _prevTotalGO = totalGO;
+                _prevTotalComp = totalComp;
+                _deltaSampleCount++;
+            }
+            catch (Exception e)
+            {
+                Logger.LogError("Delta census failed: " + e);
+            }
+        }
+
+        // DDOL root name -> total component count in its hierarchy. Duplicate root names are summed.
+        private static Dictionary<string, int> DontDestroyOnLoadRootCounts()
+        {
+            var probe = new GameObject("__diag_ddol_probe__");
+            DontDestroyOnLoad(probe);
+            var result = new Dictionary<string, int>(32);
+            try
+            {
+                var roots = probe.scene.GetRootGameObjects();
+                for (int i = 0; i < roots.Length; i++)
+                {
+                    if (roots[i] == probe) continue;
+                    int c = roots[i].GetComponentsInChildren<Component>(true).Length;
+                    int v;
+                    result.TryGetValue(roots[i].name, out v);
+                    result[roots[i].name] = v + c;
+                }
+            }
+            finally
+            {
+                Destroy(probe);
+            }
+            return result;
         }
 
         private void ApplyAggressiveGC()
