@@ -60,7 +60,7 @@ namespace RedAllianceSpeedrun
             {
                 d.Dispose();
                 Plugin.s_steamCallbackDisposeCount++;
-                Plugin.Logger.LogInfo($"[steamfix] Disposed previous {fieldName} (total disposed: {Plugin.s_steamCallbackDisposeCount}).");
+                Plugin.Logger.LogDebug($"[steamfix] Disposed previous {fieldName} (total disposed: {Plugin.s_steamCallbackDisposeCount}).");
             }
             catch (Exception e)
             {

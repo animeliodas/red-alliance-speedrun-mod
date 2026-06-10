@@ -17,6 +17,14 @@ namespace RedAllianceSpeedrun
             public long TotalTicks;
             public long MaxTicks;
             public int CallCount;
+            public long TotalAllocBytes;
+        }
+
+        // Carried from prefix to postfix of each patched call.
+        public struct ProbeState
+        {
+            public long Ticks;
+            public long Heap;
         }
 
         // Indexed by "TypeName.MethodName". Main-thread only — no lock (Mono 2.0 lacks
@@ -35,13 +43,14 @@ namespace RedAllianceSpeedrun
 
         internal static int PatchedMethodCount;
 
-        internal static void Record(string key, long elapsedTicks)
+        internal static void Record(string key, long elapsedTicks, long allocBytes)
         {
             Stats s;
             _stats.TryGetValue(key, out s);
             s.TotalTicks += elapsedTicks;
             if (elapsedTicks > s.MaxTicks) s.MaxTicks = elapsedTicks;
             s.CallCount++;
+            if (allocBytes > 0) s.TotalAllocBytes += allocBytes;
             _stats[key] = s;
         }
 
@@ -99,6 +108,21 @@ namespace RedAllianceSpeedrun
                 sb.Append($"  {k,-60} {totalMs,8:F1} / {s.CallCount,7} / {maxMs,7:F1} / {avgUs,7:F1}\n");
             }
             Plugin.Logger.LogMessage(sb.ToString());
+
+            // Second table: same data ranked by managed allocation. This is the one that names
+            // the GC-pressure source — time and allocation rankings differ wildly.
+            snapshot.Sort((a, b) => b.Value.TotalAllocBytes.CompareTo(a.Value.TotalAllocBytes));
+            var ab = new System.Text.StringBuilder();
+            ab.Append("[uprof] top allocators (total_kb / calls / avg_bytes_per_call):\n");
+            for (int i = 0; i < top; i++)
+            {
+                var s = snapshot[i].Value;
+                if (s.TotalAllocBytes <= 0) break;
+                double totalKb = s.TotalAllocBytes / 1024.0;
+                long avgB = s.CallCount > 0 ? s.TotalAllocBytes / s.CallCount : 0;
+                ab.Append($"  {snapshot[i].Key,-60} {totalKb,9:F1} / {s.CallCount,7} / {avgB,9}\n");
+            }
+            Plugin.Logger.LogMessage(ab.ToString());
         }
 
         // The shared prefix/postfix that wraps every patched method
@@ -107,15 +131,19 @@ namespace RedAllianceSpeedrun
             // __originalMethod is supplied by Harmony as the MethodBase of the patched target.
             // We use it to derive the type+method name for aggregation.
             [HarmonyPrefix]
-            public static void Pre(MethodBase __originalMethod, out long __state)
+            public static void Pre(MethodBase __originalMethod, out ProbeState __state)
             {
-                __state = Stopwatch.GetTimestamp();
+                __state.Heap = GC.GetTotalMemory(false);
+                __state.Ticks = Stopwatch.GetTimestamp();
             }
 
             [HarmonyPostfix]
-            public static void Post(MethodBase __originalMethod, long __state)
+            public static void Post(MethodBase __originalMethod, ProbeState __state)
             {
-                long elapsed = Stopwatch.GetTimestamp() - __state;
+                long elapsed = Stopwatch.GetTimestamp() - __state.Ticks;
+                // Negative when a GC ran inside the call; clamped in Record. Slight undercount
+                // is acceptable — we want the relative ranking.
+                long alloc = GC.GetTotalMemory(false) - __state.Heap;
                 string key;
                 if (!KeyMap.TryGetValue(__originalMethod, out key))
                 {
@@ -123,7 +151,7 @@ namespace RedAllianceSpeedrun
                     key = __originalMethod.DeclaringType.Name + "." + __originalMethod.Name;
                     KeyMap[__originalMethod] = key;
                 }
-                Record(key, elapsed);
+                Record(key, elapsed, alloc);
             }
         }
 
@@ -132,7 +160,9 @@ namespace RedAllianceSpeedrun
         internal static void InstallPatches(Harmony harmony)
         {
             var mbType = typeof(MonoBehaviour);
-            var methodNames = new[] { "Update", "LateUpdate", "FixedUpdate" };
+            var methodNames = new[] { "Update", "LateUpdate", "FixedUpdate", "OnGUI" };
+            // Per-frame-ish callbacks that take parameters (patched regardless of signature).
+            var paramMethodNames = new[] { "OnTriggerStay", "OnCollisionStay", "OnControllerColliderHit", "OnRenderImage", "OnWillRenderObject", "OnPreRender", "OnPostRender" };
             var bindFlags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
 
             var prefix = new HarmonyMethod(typeof(SharedPatch).GetMethod("Pre", BindingFlags.Static | BindingFlags.Public));
@@ -198,6 +228,53 @@ namespace RedAllianceSpeedrun
                             if (failed < 5)
                                 Plugin.Logger.LogWarning($"[uprof] patch failed for {t.Name}.{methodNames[mi]}: {e.Message}");
                         }
+                    }
+
+                    // Parameterized per-frame callbacks (physics Stay, render hooks).
+                    for (int mi = 0; mi < paramMethodNames.Length; mi++)
+                    {
+                        MethodInfo m;
+                        try { m = t.GetMethod(paramMethodNames[mi], bindFlags); }
+                        catch { continue; }
+                        if ((object)m == null) continue;
+                        if (!ReferenceEquals(m.ReturnType, typeof(void))) continue;
+                        asmMethods++;
+                        try
+                        {
+                            harmony.Patch(m, prefix, postfix);
+                            KeyMap[m] = t.Name + "." + paramMethodNames[mi];
+                            asmPatched++;
+                        }
+                        catch { failed++; }
+                    }
+
+                    // Coroutines: compiler-generated iterator state machines nested in this type.
+                    // Their MoveNext IS the coroutine body — the main blind spot of Update-only
+                    // profiling.
+                    Type[] nested;
+                    try { nested = t.GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic); }
+                    catch { nested = Type.EmptyTypes; }
+                    for (int ni = 0; ni < nested.Length; ni++)
+                    {
+                        var nt = nested[ni];
+                        if (!typeof(System.Collections.IEnumerator).IsAssignableFrom(nt)) continue;
+                        MethodInfo mn;
+                        try { mn = nt.GetMethod("MoveNext", bindFlags); }
+                        catch { continue; }
+                        if ((object)mn == null) continue;
+                        asmMethods++;
+                        try
+                        {
+                            harmony.Patch(mn, prefix, postfix);
+                            // "<LoadLevel>c__Iterator7" -> "SceneManagerScript.LoadLevel[co]"
+                            string co = nt.Name;
+                            int lt = co.IndexOf('<');
+                            int gt = co.IndexOf('>');
+                            if (lt >= 0 && gt > lt) co = co.Substring(lt + 1, gt - lt - 1);
+                            KeyMap[mn] = t.Name + "." + co + "[co]";
+                            asmPatched++;
+                        }
+                        catch { failed++; }
                     }
                 }
 

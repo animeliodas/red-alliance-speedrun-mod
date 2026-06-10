@@ -33,8 +33,26 @@ namespace RedAllianceSpeedrun
         private ConfigEntry<bool> _consoleLogLeakFix;
         private ConfigEntry<bool> _aggressiveGcOnLoad;
         private ConfigEntry<bool> _disposeOrphanSteamCallbacks;
+        private ConfigEntry<bool> _deltaOnReload;
+        private ConfigEntry<bool> _orphanPrefabSweep;
+        private ConfigEntry<bool> _tonemappingLutFix;
+        private ConfigEntry<bool> _playerGraphThreadFix;
 
         private bool _devConsoleUnsubscribed;
+
+        // Previous-restart census snapshots, for the auto-delta leak logger. Each restart we
+        // census component-type counts and DDOL-root component counts, then log only what GREW
+        // since the previous restart. A type that climbs by a constant amount every restart is
+        // a leak (object created without the matching destroy). Avoids manual F12 diffing.
+        private Dictionary<string, int> _prevCompCounts;
+        private Dictionary<string, int> _prevDdolCounts;
+        private int _prevTotalGO = -1;
+        private int _prevTotalComp = -1;
+        private int _deltaSampleCount;
+        // Baseline (first census) totals: cumulative drift vs these is the true leak signal;
+        // per-restart deltas oscillate with load/unload timing.
+        private int _baseTotalGO = -1;
+        private int _baseTotalComp = -1;
 
         // Cached references to current NetworkManager's Steam callbacks. We hold these alive
         // ourselves to prevent finalizer races, and Dispose them explicitly when a new
@@ -67,9 +85,12 @@ namespace RedAllianceSpeedrun
         private int _restartCount;
         private int _frameInWindow;
 
-        // Allocation-rate sample (KB/sec, derived from Profiler.GetMonoUsedSizeLong deltas)
+        // Allocation-rate sample (KB/sec). Positive per-frame deltas of GC.GetTotalMemory are
+        // accumulated; sampling once per second misses everything a GC already collected inside
+        // the window, which underreports badly when GCs run several times per second.
         private float _allocLastSampleTime;
-        private long _allocLastBytes;
+        private long _allocPrevFrameBytes;
+        private long _allocAccumBytes;
         private float _lastAllocKbPerSec;
         private float _lastGcPerSec;
         private int _lastGcCount;
@@ -99,14 +120,45 @@ namespace RedAllianceSpeedrun
                 "Hotkeys", "ProfilerDumpKey", KeyCode.F9,
                 "Dumps the InvokeRepeating profiler stats: which periodic callbacks have eaten the most CPU since last dump. Resets counters after each dump. (F10 is sometimes captured by the OS, F9 is safer.)");
             _invokeRepeatingProfilerEnabled = Config.Bind(
-                "Diagnostics", "InvokeRepeatingProfiler", true,
+                "Diagnostics", "InvokeRepeatingProfiler", false,
                 "Time every call to common ~1-second InvokeRepeating callbacks (GlobalAIScript, LightDistanceCullingScript, ObjectDisableScript, FootStepsScriptNew, AILightHeightOptimizationScript). F11 dumps top consumers.");
             _updateProfilerEnabled = Config.Bind(
-                "Diagnostics", "UpdateProfiler", true,
+                "Diagnostics", "UpdateProfiler", false,
                 "Patch Update/LateUpdate/FixedUpdate of EVERY game MonoBehaviour subclass with a Stopwatch timer. Heavy (patches 50-100+ methods) but reveals which per-frame method actually takes time. F11 dumps top consumers.");
             _diagOnReload = Config.Bind(
-                "Diagnostics", "LogOnLevelLoad", true,
+                "Diagnostics", "LogOnLevelLoad", false,
                 "Log RT/material/audio/DDOL counts after every scene load.");
+            _deltaOnReload = Config.Bind(
+                "Diagnostics", "DeltaOnLevelLoad", false,
+                "After each gameplay scene load, census component-type counts + DDOL-root component " +
+                "counts and log ONLY what GREW since the previous restart ([delta] lines). A type that " +
+                "climbs by a constant amount every restart is a leak. Removes need for manual F12 diffing. " +
+                "Adds one full-object census per load (~deep-diag cost); set false to disable.");
+            _orphanPrefabSweep = Config.Bind(
+                "LeakFix", "OrphanPrefabSweep", false,
+                "Each Transfer-mode restart strands a full copy of the player and _Canvas_Player " +
+                "prefab templates in asset space (outside any scene), where scene reloads never " +
+                "destroy them and UnloadUnusedAssets cannot free them (lingering managed refs). " +
+                "~1450 GameObjects leak per restart, inflating every GC pass and FindObjectsOfType " +
+                "scan into 200-400ms spikes. This sweep destroys duplicate asset-space templates " +
+                "after each load, keeping only those referenced by the live NetworkManager and " +
+                "PlayerStatsSp.");
+            _tonemappingLutFix = Config.Bind(
+                "LeakFix", "TonemappingLutFix", true,
+                "TonemappingColorGrading.OnRenderImage regenerates its LUT every frame in fastMode " +
+                "(Create1DLut never assigns m_LutTex, so the 'm_LutTex == null' rebuild check stays " +
+                "true forever): a Color[] allocation + SetPixels + GPU upload per frame, ~10MB of " +
+                "managed churn per thousand frames, driving Boehm GC to 10+ collections/sec. " +
+                "Install a marker texture after UpdateLut so the LUT is only rebuilt when dirty.");
+            _playerGraphThreadFix = Config.Bind(
+                "LeakFix", "PlayerGraphThreadFix", true,
+                "PlayerGraphScript.Start spawns 'new Thread(Count)' whose body is an infinite loop " +
+                "calling GC.GetTotalMemory(forceFullCollection: TRUE) every second - a forced full " +
+                "blocking GC. The thread has no exit condition and outlives its GameObject, and the " +
+                "stats canvas is recreated on every level load, so each restart permanently adds one " +
+                "more GC-forcing thread (gc/s grows ~1 per restart; the game stutters after 20-30 " +
+                "loads). Replace the loop: generation-tagged so superseded threads exit, and the " +
+                "memory stat is read without forcing a collection.");
             _restartInMenu = Config.Bind(
                 "Hotkeys", "RestartInMenu", false,
                 "If false, the restart key is ignored when the active scene is main_menu, credits, or start_screen.");
@@ -158,6 +210,34 @@ namespace RedAllianceSpeedrun
                 catch (Exception e)
                 {
                     Logger.LogError("[steamfix] Failed to install Harmony patch: " + e);
+                }
+            }
+
+            if (_tonemappingLutFix.Value)
+            {
+                try
+                {
+                    var harmony = new Harmony(GUID + ".lutfix");
+                    harmony.PatchAll(typeof(TonemappingLutFixPatch));
+                    Logger.LogInfo("[lutfix] Harmony patch installed on TonemappingColorGrading.UpdateLut.");
+                }
+                catch (Exception e)
+                {
+                    Logger.LogError("[lutfix] Failed to install Harmony patch: " + e);
+                }
+            }
+
+            if (_playerGraphThreadFix.Value)
+            {
+                try
+                {
+                    var harmony = new Harmony(GUID + ".graphfix");
+                    harmony.PatchAll(typeof(PlayerGraphThreadFixPatch));
+                    Logger.LogInfo("[graphfix] Harmony patch installed on PlayerGraphScript.Count.");
+                }
+                catch (Exception e)
+                {
+                    Logger.LogError("[graphfix] Failed to install Harmony patch: " + e);
                 }
             }
 
@@ -272,6 +352,299 @@ namespace RedAllianceSpeedrun
             {
                 LogDiagnostics("post-load:" + scene.name);
             }
+
+            if (!earlyScene &&
+                ((_deltaOnReload != null && _deltaOnReload.Value) ||
+                 (_orphanPrefabSweep != null && _orphanPrefabSweep.Value)))
+            {
+                StartCoroutine(DeltaAfterLoad(scene.name));
+            }
+        }
+
+        // Wait for the scene to fully settle (past the load-spike burst), then sweep orphan
+        // prefab templates and census per-restart growth. Sweep runs first so the census
+        // measures the post-fix state. Delayed enough that the new NetworkManager spawned the
+        // player and PlayerStatsSp.Awake instantiated the canvas (their templates must be live
+        // so the sweep knows what to keep).
+        private IEnumerator DeltaAfterLoad(string sceneName)
+        {
+            for (int i = 0; i < 25; i++) yield return null;
+            if (_orphanPrefabSweep != null && _orphanPrefabSweep.Value)
+            {
+                SweepOrphanPrefabTemplates(sceneName);
+            }
+            for (int i = 0; i < 5; i++) yield return null;
+            if (_deltaOnReload != null && _deltaOnReload.Value)
+            {
+                LogRestartDelta(sceneName);
+            }
+        }
+
+        // Destroy duplicate prefab-template copies stranded in asset space by Transfer restarts.
+        // Only touches root objects outside any scene, with default hideFlags, whose name matches
+        // a known leaked template (player prefab, _Canvas_Player), and which are NOT the copy
+        // currently referenced by the live NetworkManager / PlayerStatsSp.
+        private void SweepOrphanPrefabTemplates(string tag)
+        {
+            try
+            {
+                var keepIds = new HashSet<int>();
+                var sweepNames = new HashSet<string> { "_Canvas_Player" };
+
+                var nm = NetworkManager.Instance;
+                if ((bool)nm)
+                {
+                    var f = typeof(NetworkManager).GetField("playerPrefab",
+                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    var prefab = ((object)f != null) ? f.GetValue(nm) as GameObject : null;
+                    if ((bool)prefab)
+                    {
+                        keepIds.Add(prefab.GetInstanceID());
+                        sweepNames.Add(prefab.name);
+                    }
+                }
+                var wc = WorldComponents.Instance;
+                if ((bool)wc)
+                {
+                    var pss = wc.PlayerStatsSp;
+                    if ((bool)pss && (bool)pss.hudCanvas)
+                    {
+                        keepIds.Add(pss.hudCanvas.GetInstanceID());
+                    }
+                }
+                if (keepIds.Count == 0)
+                {
+                    // No live template references found — destroying anything now could kill the
+                    // only remaining copy. Skip this load.
+                    Logger.LogWarning($"[orphanfix {tag}] no live template refs; sweep skipped.");
+                    return;
+                }
+
+                int destroyed = 0, comps = 0;
+                var all = Resources.FindObjectsOfTypeAll<GameObject>();
+                for (int i = 0; i < all.Length; i++)
+                {
+                    var go = all[i];
+                    if (go == null) continue;
+                    if (go.scene.IsValid()) continue;                 // asset space only
+                    if (go.transform.parent != null) continue;        // roots only
+                    // Match the template name itself or a stranded runtime clone of it
+                    // ("_Canvas_Player(Clone)"); clones in asset space are always leaks.
+                    string baseName = go.name.EndsWith("(Clone)")
+                        ? go.name.Substring(0, go.name.Length - 7)
+                        : go.name;
+                    if (!sweepNames.Contains(baseName)) continue;
+                    if (keepIds.Contains(go.GetInstanceID())) continue;
+                    comps += go.GetComponentsInChildren<Component>(true).Length;
+                    DestroyImmediate(go, true);
+                    destroyed++;
+                }
+                if (destroyed > 0)
+                {
+                    Resources.UnloadUnusedAssets();
+                    GC.Collect();
+                }
+                Logger.LogMessage(
+                    $"[orphanfix {tag}] destroyed={destroyed} orphan template root(s) (~{comps} components)  " +
+                    $"sweepNames=[{string.Join(", ", new List<string>(sweepNames).ToArray())}]");
+            }
+            catch (Exception e)
+            {
+                Logger.LogError("Orphan prefab sweep failed: " + e);
+            }
+        }
+
+        // Census component-type counts + DDOL-root component counts, then log only entries that
+        // grew vs the previous restart. Constant per-restart growth == a leak. Heavy (one full
+        // FindObjectsOfTypeAll<Component> walk) but runs once per load.
+        private void LogRestartDelta(string tag)
+        {
+            try
+            {
+                // Component-type census.
+                var compCounts = new Dictionary<string, int>(1024);
+                var allComps = Resources.FindObjectsOfTypeAll<Component>();
+                int totalComp = 0;
+                for (int i = 0; i < allComps.Length; i++)
+                {
+                    var c = allComps[i];
+                    if (c == null) continue;
+                    totalComp++;
+                    var n = c.GetType().Name;
+                    int v;
+                    compCounts.TryGetValue(n, out v);
+                    compCounts[n] = v + 1;
+                }
+                int totalGO = Resources.FindObjectsOfTypeAll<GameObject>().Length;
+
+                // DDOL-root component-count census (Object_Pool, _NetworkManager, etc.).
+                var ddolCounts = DontDestroyOnLoadRootCounts();
+
+                if (_prevCompCounts == null)
+                {
+                    _baseTotalGO = totalGO;
+                    _baseTotalComp = totalComp;
+                    Logger.LogMessage(
+                        $"[delta {tag}] baseline #{_deltaSampleCount}: GO={totalGO} Comp={totalComp} " +
+                        $"ddolRoots={ddolCounts.Count}. Restart again to see growth.");
+                }
+                else
+                {
+                    int dGO = totalGO - _prevTotalGO;
+                    int dComp = totalComp - _prevTotalComp;
+                    // Cumulative drift vs baseline + perf trend: the one line that matters for
+                    // "does it degrade per restart". Flat cum + rising gc/s = allocation problem,
+                    // not an object leak.
+                    Logger.LogMessage(
+                        $"[delta-cum {tag} #{_deltaSampleCount}] vs baseline: dGO={totalGO - _baseTotalGO:+#;-#;0} " +
+                        $"dComp={totalComp - _baseTotalComp:+#;-#;0}  perf: fps={_lastFps:F1} gc/s={_lastGcPerSec:F1} " +
+                        $"alloc={_lastAllocKbPerSec:F0}KB/s p99={_lastFrameP99Ms:F1}ms");
+
+                    // Grown component types, by descending delta.
+                    var grown = new List<KeyValuePair<string, int>>();
+                    foreach (var kv in compCounts)
+                    {
+                        int prev;
+                        _prevCompCounts.TryGetValue(kv.Key, out prev);
+                        int d = kv.Value - prev;
+                        if (d > 0) grown.Add(new KeyValuePair<string, int>(kv.Key, d));
+                    }
+                    grown.Sort((a, b) => b.Value.CompareTo(a.Value));
+
+                    var sb = new System.Text.StringBuilder();
+                    sb.Append($"[delta {tag} #{_deltaSampleCount}] dGO={dGO:+#;-#;0} dComp={dComp:+#;-#;0}  grownTypes: ");
+                    if (grown.Count == 0) sb.Append("(none)");
+                    int top = Math.Min(15, grown.Count);
+                    for (int i = 0; i < top; i++)
+                    {
+                        if (i > 0) sb.Append(", ");
+                        sb.Append(grown[i].Key).Append("+").Append(grown[i].Value);
+                    }
+                    Logger.LogMessage(sb.ToString());
+
+                    // Locate the top grown types: histogram of where their instances live
+                    // (scene/rootObject, or asset/hidden if not in a loaded scene). Distinguishes
+                    // a scene-object leak from assets pinned in memory.
+                    int locTypes = Math.Min(5, grown.Count);
+                    for (int t = 0; t < locTypes; t++)
+                    {
+                        string typeName = grown[t].Key;
+                        var locCounts = new Dictionary<string, int>(16);
+                        for (int i = 0; i < allComps.Length; i++)
+                        {
+                            var c = allComps[i];
+                            if (c == null || c.GetType().Name != typeName) continue;
+                            string loc;
+                            var go = c.gameObject;
+                            var s = go.scene;
+                            var tr = go.transform;
+                            while (tr.parent != null) tr = tr.parent;
+                            if (s.IsValid())
+                            {
+                                loc = s.name + "/" + tr.name + (go.activeInHierarchy ? "" : "(off)");
+                            }
+                            else
+                            {
+                                loc = "asset/" + tr.name + "(hf=" + tr.gameObject.hideFlags + ")";
+                            }
+                            int v;
+                            locCounts.TryGetValue(loc, out v);
+                            locCounts[loc] = v + 1;
+                        }
+                        var locs = new List<KeyValuePair<string, int>>(locCounts);
+                        locs.Sort((a, b) => b.Value.CompareTo(a.Value));
+                        var lb = new System.Text.StringBuilder();
+                        lb.Append($"[delta-loc {tag} #{_deltaSampleCount}] {typeName}: ");
+                        int topL = Math.Min(6, locs.Count);
+                        for (int i = 0; i < topL; i++)
+                        {
+                            if (i > 0) lb.Append(", ");
+                            lb.Append(locs[i].Key).Append("=").Append(locs[i].Value);
+                        }
+                        Logger.LogMessage(lb.ToString());
+                    }
+
+                    // Asset-space root census: every root GameObject outside any scene, with its
+                    // hideFlags and hierarchy component count. Leaked template copies show up here
+                    // as repeated names. Logged every delta so growth across restarts is visible.
+                    var assetRootComps = new Dictionary<string, int>(64);
+                    var assetRootInstances = new Dictionary<string, int>(64);
+                    var allGOs2 = Resources.FindObjectsOfTypeAll<GameObject>();
+                    for (int i = 0; i < allGOs2.Length; i++)
+                    {
+                        var go = allGOs2[i];
+                        if (go == null || go.scene.IsValid() || go.transform.parent != null) continue;
+                        int cc = go.GetComponentsInChildren<Component>(true).Length;
+                        if (cc < 25) continue; // skip tiny utility prefabs; leak copies are huge
+                        string key = go.name + "(hf=" + go.hideFlags + ")";
+                        int v;
+                        assetRootComps.TryGetValue(key, out v);
+                        assetRootComps[key] = v + cc;
+                        assetRootInstances.TryGetValue(key, out v);
+                        assetRootInstances[key] = v + 1;
+                    }
+                    var rootsSorted = new List<KeyValuePair<string, int>>(assetRootComps);
+                    rootsSorted.Sort((a, b) => b.Value.CompareTo(a.Value));
+                    var ab = new System.Text.StringBuilder();
+                    ab.Append($"[delta-asset {tag} #{_deltaSampleCount}] big asset roots (name=copies/totalComps): ");
+                    int topA = Math.Min(12, rootsSorted.Count);
+                    for (int i = 0; i < topA; i++)
+                    {
+                        if (i > 0) ab.Append(", ");
+                        ab.Append(rootsSorted[i].Key).Append("=")
+                          .Append(assetRootInstances[rootsSorted[i].Key]).Append("/")
+                          .Append(rootsSorted[i].Value);
+                    }
+                    Logger.LogMessage(ab.ToString());
+
+                    // Grown DDOL roots.
+                    var ddolGrown = new List<string>();
+                    foreach (var kv in ddolCounts)
+                    {
+                        int prev;
+                        _prevDdolCounts.TryGetValue(kv.Key, out prev);
+                        int d = kv.Value - prev;
+                        if (d != 0) ddolGrown.Add($"{kv.Key}{d:+#;-#;0}(now {kv.Value})");
+                    }
+                    Logger.LogMessage("[delta " + tag + " #" + _deltaSampleCount + "] ddolRootDelta: " +
+                        (ddolGrown.Count == 0 ? "(none)" : string.Join(", ", ddolGrown.ToArray())));
+                }
+
+                _prevCompCounts = compCounts;
+                _prevDdolCounts = ddolCounts;
+                _prevTotalGO = totalGO;
+                _prevTotalComp = totalComp;
+                _deltaSampleCount++;
+            }
+            catch (Exception e)
+            {
+                Logger.LogError("Delta census failed: " + e);
+            }
+        }
+
+        // DDOL root name -> total component count in its hierarchy. Duplicate root names are summed.
+        private static Dictionary<string, int> DontDestroyOnLoadRootCounts()
+        {
+            var probe = new GameObject("__diag_ddol_probe__");
+            DontDestroyOnLoad(probe);
+            var result = new Dictionary<string, int>(32);
+            try
+            {
+                var roots = probe.scene.GetRootGameObjects();
+                for (int i = 0; i < roots.Length; i++)
+                {
+                    if (roots[i] == probe) continue;
+                    int c = roots[i].GetComponentsInChildren<Component>(true).Length;
+                    int v;
+                    result.TryGetValue(roots[i].name, out v);
+                    result[roots[i].name] = v + c;
+                }
+            }
+            finally
+            {
+                Destroy(probe);
+            }
+            return result;
         }
 
         private void ApplyAggressiveGC()
@@ -288,7 +661,7 @@ namespace RedAllianceSpeedrun
                 sw.Stop();
                 long afterMb = GC.GetTotalMemory(false) / (1024L * 1024L);
                 int afterGc = GC.CollectionCount(0);
-                Logger.LogInfo($"[gcfix] {sw.ElapsedMilliseconds}ms  mono {beforeMb}->{afterMb}MB  gc+={afterGc - beforeGc}");
+                Logger.LogDebug($"[gcfix] {sw.ElapsedMilliseconds}ms  mono {beforeMb}->{afterMb}MB  gc+={afterGc - beforeGc}");
             }
             catch (Exception e)
             {
@@ -320,7 +693,7 @@ namespace RedAllianceSpeedrun
                     {
                         int before = list.Count;
                         list.Clear();
-                        Logger.LogInfo($"[consolefix] consoleMessages cleared ({before} entries).");
+                        Logger.LogDebug($"[consolefix] consoleMessages cleared ({before} entries).");
                     }
                 }
             }
@@ -363,7 +736,7 @@ namespace RedAllianceSpeedrun
             finally
             {
                 if (cleared > 0)
-                    Logger.LogInfo($"[leakfix] scene='{sceneName}'  flagged={cleared}  freed={destroyed}");
+                    Logger.LogDebug($"[leakfix] scene='{sceneName}'  flagged={cleared}  freed={destroyed}");
             }
 
             if (_diagOnReload != null && _diagOnReload.Value)
@@ -422,6 +795,16 @@ namespace RedAllianceSpeedrun
             int gcDelta = gcNowSample - _lastGcSampleCount;
             _lastGcSampleCount = gcNowSample;
 
+            // Accumulate this frame's managed allocation (positive heap delta only; a GC inside
+            // the frame makes the delta negative, which we ignore — we measure allocation, not
+            // survival).
+            long heapNow = GC.GetTotalMemory(false);
+            if (heapNow > _allocPrevFrameBytes)
+            {
+                _allocAccumBytes += heapNow - _allocPrevFrameBytes;
+            }
+            _allocPrevFrameBytes = heapNow;
+
             // Per-spike trace: log individual frames that exceed the threshold
             float spikeThreshold = _spikeLogThresholdMs != null ? _spikeLogThresholdMs.Value : 50f;
             if (spikeThreshold > 0f && frameMs > spikeThreshold)
@@ -446,22 +829,17 @@ namespace RedAllianceSpeedrun
             float now = Time.unscaledTime;
             if (now - _allocLastSampleTime >= 1f)
             {
-                long monoNow = 0;
-                try { monoNow = Profiler.GetMonoUsedSizeLong(); } catch { }
                 int gcNow = GC.CollectionCount(0);
 
                 if (_allocLastSampleTime > 0f)
                 {
                     float dt = now - _allocLastSampleTime;
-                    long delta = monoNow - _allocLastBytes;
-                    // If GC ran during this window, the delta can be negative; clamp.
-                    if (delta < 0) delta = 0;
-                    _lastAllocKbPerSec = (delta / 1024f) / dt;
+                    _lastAllocKbPerSec = (_allocAccumBytes / 1024f) / dt;
                     _lastGcPerSec = (gcNow - _lastGcCount) / dt;
                     _lastLogsPerSec = (int)(_logCountThisWindow / dt);
                 }
 
-                _allocLastBytes = monoNow;
+                _allocAccumBytes = 0;
                 _allocLastSampleTime = now;
                 _lastGcCount = gcNow;
                 _logCountThisWindow = 0;
