@@ -34,6 +34,7 @@ namespace RedAllianceSpeedrun
         private ConfigEntry<bool> _aggressiveGcOnLoad;
         private ConfigEntry<bool> _disposeOrphanSteamCallbacks;
         private ConfigEntry<bool> _deltaOnReload;
+        private ConfigEntry<bool> _orphanPrefabSweep;
 
         private bool _devConsoleUnsubscribed;
 
@@ -124,6 +125,15 @@ namespace RedAllianceSpeedrun
                 "counts and log ONLY what GREW since the previous restart ([delta] lines). A type that " +
                 "climbs by a constant amount every restart is a leak. Removes need for manual F12 diffing. " +
                 "Adds one full-object census per load (~deep-diag cost); set false to disable.");
+            _orphanPrefabSweep = Config.Bind(
+                "LeakFix", "OrphanPrefabSweep", true,
+                "Each Transfer-mode restart strands a full copy of the player and _Canvas_Player " +
+                "prefab templates in asset space (outside any scene), where scene reloads never " +
+                "destroy them and UnloadUnusedAssets cannot free them (lingering managed refs). " +
+                "~1450 GameObjects leak per restart, inflating every GC pass and FindObjectsOfType " +
+                "scan into 200-400ms spikes. This sweep destroys duplicate asset-space templates " +
+                "after each load, keeping only those referenced by the live NetworkManager and " +
+                "PlayerStatsSp.");
             _restartInMenu = Config.Bind(
                 "Hotkeys", "RestartInMenu", false,
                 "If false, the restart key is ignored when the active scene is main_menu, credits, or start_screen.");
@@ -290,18 +300,101 @@ namespace RedAllianceSpeedrun
                 LogDiagnostics("post-load:" + scene.name);
             }
 
-            if (!earlyScene && _deltaOnReload != null && _deltaOnReload.Value)
+            if (!earlyScene &&
+                ((_deltaOnReload != null && _deltaOnReload.Value) ||
+                 (_orphanPrefabSweep != null && _orphanPrefabSweep.Value)))
             {
                 StartCoroutine(DeltaAfterLoad(scene.name));
             }
         }
 
-        // Wait for the scene to fully settle (past the load-spike burst), then census and log
-        // per-restart growth. Delayed enough that pooled objects are re-parented and Start() ran.
+        // Wait for the scene to fully settle (past the load-spike burst), then sweep orphan
+        // prefab templates and census per-restart growth. Sweep runs first so the census
+        // measures the post-fix state. Delayed enough that the new NetworkManager spawned the
+        // player and PlayerStatsSp.Awake instantiated the canvas (their templates must be live
+        // so the sweep knows what to keep).
         private IEnumerator DeltaAfterLoad(string sceneName)
         {
-            for (int i = 0; i < 30; i++) yield return null;
-            LogRestartDelta(sceneName);
+            for (int i = 0; i < 25; i++) yield return null;
+            if (_orphanPrefabSweep != null && _orphanPrefabSweep.Value)
+            {
+                SweepOrphanPrefabTemplates(sceneName);
+            }
+            for (int i = 0; i < 5; i++) yield return null;
+            if (_deltaOnReload != null && _deltaOnReload.Value)
+            {
+                LogRestartDelta(sceneName);
+            }
+        }
+
+        // Destroy duplicate prefab-template copies stranded in asset space by Transfer restarts.
+        // Only touches root objects outside any scene, with default hideFlags, whose name matches
+        // a known leaked template (player prefab, _Canvas_Player), and which are NOT the copy
+        // currently referenced by the live NetworkManager / PlayerStatsSp.
+        private void SweepOrphanPrefabTemplates(string tag)
+        {
+            try
+            {
+                var keepIds = new HashSet<int>();
+                var sweepNames = new HashSet<string> { "_Canvas_Player" };
+
+                var nm = NetworkManager.Instance;
+                if ((bool)nm)
+                {
+                    var f = typeof(NetworkManager).GetField("playerPrefab",
+                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    var prefab = ((object)f != null) ? f.GetValue(nm) as GameObject : null;
+                    if ((bool)prefab)
+                    {
+                        keepIds.Add(prefab.GetInstanceID());
+                        sweepNames.Add(prefab.name);
+                    }
+                }
+                var wc = WorldComponents.Instance;
+                if ((bool)wc)
+                {
+                    var pss = wc.PlayerStatsSp;
+                    if ((bool)pss && (bool)pss.hudCanvas)
+                    {
+                        keepIds.Add(pss.hudCanvas.GetInstanceID());
+                    }
+                }
+                if (keepIds.Count == 0)
+                {
+                    // No live template references found — destroying anything now could kill the
+                    // only remaining copy. Skip this load.
+                    Logger.LogWarning($"[orphanfix {tag}] no live template refs; sweep skipped.");
+                    return;
+                }
+
+                int destroyed = 0, comps = 0;
+                var all = Resources.FindObjectsOfTypeAll<GameObject>();
+                for (int i = 0; i < all.Length; i++)
+                {
+                    var go = all[i];
+                    if (go == null) continue;
+                    if (go.scene.IsValid()) continue;                 // asset space only
+                    if (go.transform.parent != null) continue;        // roots only
+                    if (go.hideFlags != HideFlags.None) continue;
+                    if (!sweepNames.Contains(go.name)) continue;
+                    if (keepIds.Contains(go.GetInstanceID())) continue;
+                    comps += go.GetComponentsInChildren<Component>(true).Length;
+                    DestroyImmediate(go, true);
+                    destroyed++;
+                }
+                if (destroyed > 0)
+                {
+                    Resources.UnloadUnusedAssets();
+                    GC.Collect();
+                }
+                Logger.LogMessage(
+                    $"[orphanfix {tag}] destroyed={destroyed} orphan template root(s) (~{comps} components)  " +
+                    $"sweepNames=[{string.Join(", ", new List<string>(sweepNames).ToArray())}]");
+            }
+            catch (Exception e)
+            {
+                Logger.LogError("Orphan prefab sweep failed: " + e);
+            }
         }
 
         // Census component-type counts + DDOL-root component counts, then log only entries that
