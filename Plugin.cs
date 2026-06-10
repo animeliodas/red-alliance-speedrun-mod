@@ -375,8 +375,12 @@ namespace RedAllianceSpeedrun
                     if (go == null) continue;
                     if (go.scene.IsValid()) continue;                 // asset space only
                     if (go.transform.parent != null) continue;        // roots only
-                    if (go.hideFlags != HideFlags.None) continue;
-                    if (!sweepNames.Contains(go.name)) continue;
+                    // Match the template name itself or a stranded runtime clone of it
+                    // ("_Canvas_Player(Clone)"); clones in asset space are always leaks.
+                    string baseName = go.name.EndsWith("(Clone)")
+                        ? go.name.Substring(0, go.name.Length - 7)
+                        : go.name;
+                    if (!sweepNames.Contains(baseName)) continue;
                     if (keepIds.Contains(go.GetInstanceID())) continue;
                     comps += go.GetComponentsInChildren<Component>(true).Length;
                     DestroyImmediate(go, true);
@@ -471,15 +475,15 @@ namespace RedAllianceSpeedrun
                             string loc;
                             var go = c.gameObject;
                             var s = go.scene;
+                            var tr = go.transform;
+                            while (tr.parent != null) tr = tr.parent;
                             if (s.IsValid())
                             {
-                                var tr = go.transform;
-                                while (tr.parent != null) tr = tr.parent;
                                 loc = s.name + "/" + tr.name + (go.activeInHierarchy ? "" : "(off)");
                             }
                             else
                             {
-                                loc = "asset/hidden(hideFlags=" + go.hideFlags + ")";
+                                loc = "asset/" + tr.name + "(hf=" + tr.gameObject.hideFlags + ")";
                             }
                             int v;
                             locCounts.TryGetValue(loc, out v);
@@ -497,6 +501,39 @@ namespace RedAllianceSpeedrun
                         }
                         Logger.LogMessage(lb.ToString());
                     }
+
+                    // Asset-space root census: every root GameObject outside any scene, with its
+                    // hideFlags and hierarchy component count. Leaked template copies show up here
+                    // as repeated names. Logged every delta so growth across restarts is visible.
+                    var assetRootComps = new Dictionary<string, int>(64);
+                    var assetRootInstances = new Dictionary<string, int>(64);
+                    var allGOs2 = Resources.FindObjectsOfTypeAll<GameObject>();
+                    for (int i = 0; i < allGOs2.Length; i++)
+                    {
+                        var go = allGOs2[i];
+                        if (go == null || go.scene.IsValid() || go.transform.parent != null) continue;
+                        int cc = go.GetComponentsInChildren<Component>(true).Length;
+                        if (cc < 25) continue; // skip tiny utility prefabs; leak copies are huge
+                        string key = go.name + "(hf=" + go.hideFlags + ")";
+                        int v;
+                        assetRootComps.TryGetValue(key, out v);
+                        assetRootComps[key] = v + cc;
+                        assetRootInstances.TryGetValue(key, out v);
+                        assetRootInstances[key] = v + 1;
+                    }
+                    var rootsSorted = new List<KeyValuePair<string, int>>(assetRootComps);
+                    rootsSorted.Sort((a, b) => b.Value.CompareTo(a.Value));
+                    var ab = new System.Text.StringBuilder();
+                    ab.Append($"[delta-asset {tag} #{_deltaSampleCount}] big asset roots (name=copies/totalComps): ");
+                    int topA = Math.Min(12, rootsSorted.Count);
+                    for (int i = 0; i < topA; i++)
+                    {
+                        if (i > 0) ab.Append(", ");
+                        ab.Append(rootsSorted[i].Key).Append("=")
+                          .Append(assetRootInstances[rootsSorted[i].Key]).Append("/")
+                          .Append(rootsSorted[i].Value);
+                    }
+                    Logger.LogMessage(ab.ToString());
 
                     // Grown DDOL roots.
                     var ddolGrown = new List<string>();
@@ -562,7 +599,7 @@ namespace RedAllianceSpeedrun
                 sw.Stop();
                 long afterMb = GC.GetTotalMemory(false) / (1024L * 1024L);
                 int afterGc = GC.CollectionCount(0);
-                Logger.LogInfo($"[gcfix] {sw.ElapsedMilliseconds}ms  mono {beforeMb}->{afterMb}MB  gc+={afterGc - beforeGc}");
+                Logger.LogDebug($"[gcfix] {sw.ElapsedMilliseconds}ms  mono {beforeMb}->{afterMb}MB  gc+={afterGc - beforeGc}");
             }
             catch (Exception e)
             {
@@ -594,7 +631,7 @@ namespace RedAllianceSpeedrun
                     {
                         int before = list.Count;
                         list.Clear();
-                        Logger.LogInfo($"[consolefix] consoleMessages cleared ({before} entries).");
+                        Logger.LogDebug($"[consolefix] consoleMessages cleared ({before} entries).");
                     }
                 }
             }
@@ -637,7 +674,7 @@ namespace RedAllianceSpeedrun
             finally
             {
                 if (cleared > 0)
-                    Logger.LogInfo($"[leakfix] scene='{sceneName}'  flagged={cleared}  freed={destroyed}");
+                    Logger.LogDebug($"[leakfix] scene='{sceneName}'  flagged={cleared}  freed={destroyed}");
             }
 
             if (_diagOnReload != null && _diagOnReload.Value)
