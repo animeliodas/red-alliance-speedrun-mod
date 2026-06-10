@@ -37,6 +37,7 @@ namespace RedAllianceSpeedrun
         private ConfigEntry<bool> _orphanPrefabSweep;
         private ConfigEntry<bool> _tonemappingLutFix;
         private ConfigEntry<bool> _playerGraphThreadFix;
+        private ConfigEntry<bool> _disableGuiLayoutPass;
 
         private bool _devConsoleUnsubscribed;
 
@@ -300,6 +301,15 @@ namespace RedAllianceSpeedrun
                 }
             }
 
+            _disableGuiLayoutPass = Config.Bind(
+                "Optimizations", "DisableGUILayoutPass", true,
+                "Legacy IMGUI calls every OnGUI twice per frame (Layout + Repaint) and allocates " +
+                "an Event object per pass (~1KB/call measured on PlayerGraphScript alone). " +
+                "PlayerGraphScript, CrosshairScript, FadeScript and SceneManagerScript only use " +
+                "direct GUI.* calls with explicit Rects - the Layout pass is pure waste for them. " +
+                "Set useGUILayout=false on those components after each scene load. " +
+                "DeveloperConsoleScript uses GUILayout and is left untouched.");
+
             // WaterPhysicsScript.FloatObjects replacement — opt-in
             var waterOpt = Config.Bind(
                 "Optimizations", "PatchWaterPhysics", false,
@@ -380,6 +390,36 @@ namespace RedAllianceSpeedrun
             {
                 StartCoroutine(DeltaAfterLoad(scene.name));
             }
+
+            if (_disableGuiLayoutPass != null && _disableGuiLayoutPass.Value)
+            {
+                StartCoroutine(DisableGuiLayoutAfterLoad());
+            }
+        }
+
+        // Turn off the IMGUI Layout pass on OnGUI scripts that only use direct GUI.* calls.
+        // Halves their OnGUI invocations and removes the per-pass Event allocation. Runs a few
+        // frames after load so the scene's singletons exist.
+        private IEnumerator DisableGuiLayoutAfterLoad()
+        {
+            for (int i = 0; i < 5; i++) yield return null;
+            int n = 0;
+            try
+            {
+                var graph = FindObjectOfType<PlayerGraphScript>();
+                if ((bool)graph && graph.useGUILayout) { graph.useGUILayout = false; n++; }
+                var cross = FindObjectOfType<CrosshairScript>();
+                if ((bool)cross && cross.useGUILayout) { cross.useGUILayout = false; n++; }
+                var fade = FindObjectOfType<FadeScript>();
+                if ((bool)fade && fade.useGUILayout) { fade.useGUILayout = false; n++; }
+                var smgr = SceneManagerScript.Instance;
+                if ((bool)smgr && smgr.useGUILayout) { smgr.useGUILayout = false; n++; }
+            }
+            catch (Exception e)
+            {
+                Logger.LogError("[guifix] failed: " + e);
+            }
+            if (n > 0) Logger.LogDebug($"[guifix] disabled GUI layout pass on {n} component(s).");
         }
 
         // Wait for the scene to fully settle (past the load-spike burst), then sweep orphan
