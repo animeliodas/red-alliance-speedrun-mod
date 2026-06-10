@@ -36,6 +36,7 @@ namespace RedAllianceSpeedrun
         private ConfigEntry<bool> _deltaOnReload;
         private ConfigEntry<bool> _orphanPrefabSweep;
         private ConfigEntry<bool> _tonemappingLutFix;
+        private ConfigEntry<bool> _playerGraphThreadFix;
 
         private bool _devConsoleUnsubscribed;
 
@@ -149,6 +150,15 @@ namespace RedAllianceSpeedrun
                 "true forever): a Color[] allocation + SetPixels + GPU upload per frame, ~10MB of " +
                 "managed churn per thousand frames, driving Boehm GC to 10+ collections/sec. " +
                 "Install a marker texture after UpdateLut so the LUT is only rebuilt when dirty.");
+            _playerGraphThreadFix = Config.Bind(
+                "LeakFix", "PlayerGraphThreadFix", true,
+                "PlayerGraphScript.Start spawns 'new Thread(Count)' whose body is an infinite loop " +
+                "calling GC.GetTotalMemory(forceFullCollection: TRUE) every second - a forced full " +
+                "blocking GC. The thread has no exit condition and outlives its GameObject, and the " +
+                "stats canvas is recreated on every level load, so each restart permanently adds one " +
+                "more GC-forcing thread (gc/s grows ~1 per restart; the game stutters after 20-30 " +
+                "loads). Replace the loop: generation-tagged so superseded threads exit, and the " +
+                "memory stat is read without forcing a collection.");
             _restartInMenu = Config.Bind(
                 "Hotkeys", "RestartInMenu", false,
                 "If false, the restart key is ignored when the active scene is main_menu, credits, or start_screen.");
@@ -214,6 +224,20 @@ namespace RedAllianceSpeedrun
                 catch (Exception e)
                 {
                     Logger.LogError("[lutfix] Failed to install Harmony patch: " + e);
+                }
+            }
+
+            if (_playerGraphThreadFix.Value)
+            {
+                try
+                {
+                    var harmony = new Harmony(GUID + ".graphfix");
+                    harmony.PatchAll(typeof(PlayerGraphThreadFixPatch));
+                    Logger.LogInfo("[graphfix] Harmony patch installed on PlayerGraphScript.Count.");
+                }
+                catch (Exception e)
+                {
+                    Logger.LogError("[graphfix] Failed to install Harmony patch: " + e);
                 }
             }
 
