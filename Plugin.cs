@@ -310,6 +310,28 @@ namespace RedAllianceSpeedrun
                 "Set useGUILayout=false on those components after each scene load. " +
                 "DeveloperConsoleScript uses GUILayout and is left untouched.");
 
+            var alertInterval = Config.Bind(
+                "Optimizations", "AlertCheckFrameInterval", 2,
+                "OnEnemyKilledAllertEnemiesScript polls its entire NPC array every frame " +
+                "(distance checks per NPC, ~258us/frame measured in combat) waiting for an alert " +
+                "condition. Run the poll every Nth frame instead, staggered per instance. " +
+                "Worst-case extra reaction latency at N=2 is one frame (~10-20ms) - imperceptible. " +
+                "1 disables throttling.");
+            if (alertInterval.Value > 1)
+            {
+                try
+                {
+                    AlertCheckThrottlePatch.Interval = alertInterval.Value;
+                    var harmony = new Harmony(GUID + ".alertfix");
+                    harmony.PatchAll(typeof(AlertCheckThrottlePatch));
+                    Logger.LogInfo($"[alertfix] Alert poll throttled to every {alertInterval.Value} frames.");
+                }
+                catch (Exception e)
+                {
+                    Logger.LogError("[alertfix] Failed to patch: " + e);
+                }
+            }
+
             // WaterPhysicsScript.FloatObjects replacement — opt-in
             var waterOpt = Config.Bind(
                 "Optimizations", "PatchWaterPhysics", false,
