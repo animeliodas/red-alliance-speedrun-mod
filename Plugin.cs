@@ -279,6 +279,27 @@ namespace RedAllianceSpeedrun
             // InputManager.Update optimization disabled in v0.17.1 — broke player movement
             // in v0.17.0. Will revisit with a non-replacement approach later.
 
+            // Rope offscreen skip — the catenary recompute was the #1 Update-time consumer
+            // in every profiling session; ropes outside the camera frustum don't need it.
+            var ropeOpt = Config.Bind(
+                "Optimizations", "SkipOffscreenRopes", true,
+                "Skip LineRendererRopeScript's per-frame catenary recomputation while the rope's " +
+                "LineRenderer is not visible to any camera. Wind animation is a continuous function " +
+                "of time, so ropes re-entering view continue seamlessly. Purely visual script.");
+            if (ropeOpt.Value)
+            {
+                try
+                {
+                    var harmony = new Harmony(GUID + ".ropefix");
+                    harmony.PatchAll(typeof(RopeVisibilityPatch));
+                    Logger.LogInfo("[ropefix] Patched LineRendererRopeScript.GenerateRope (offscreen skip).");
+                }
+                catch (Exception e)
+                {
+                    Logger.LogError("[ropefix] Failed to patch: " + e);
+                }
+            }
+
             // WaterPhysicsScript.FloatObjects replacement — opt-in
             var waterOpt = Config.Bind(
                 "Optimizations", "PatchWaterPhysics", false,
