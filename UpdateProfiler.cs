@@ -160,7 +160,9 @@ namespace RedAllianceSpeedrun
         internal static void InstallPatches(Harmony harmony)
         {
             var mbType = typeof(MonoBehaviour);
-            var methodNames = new[] { "Update", "LateUpdate", "FixedUpdate" };
+            var methodNames = new[] { "Update", "LateUpdate", "FixedUpdate", "OnGUI" };
+            // Per-frame-ish callbacks that take parameters (patched regardless of signature).
+            var paramMethodNames = new[] { "OnTriggerStay", "OnCollisionStay", "OnControllerColliderHit", "OnRenderImage", "OnWillRenderObject", "OnPreRender", "OnPostRender" };
             var bindFlags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
 
             var prefix = new HarmonyMethod(typeof(SharedPatch).GetMethod("Pre", BindingFlags.Static | BindingFlags.Public));
@@ -226,6 +228,53 @@ namespace RedAllianceSpeedrun
                             if (failed < 5)
                                 Plugin.Logger.LogWarning($"[uprof] patch failed for {t.Name}.{methodNames[mi]}: {e.Message}");
                         }
+                    }
+
+                    // Parameterized per-frame callbacks (physics Stay, render hooks).
+                    for (int mi = 0; mi < paramMethodNames.Length; mi++)
+                    {
+                        MethodInfo m;
+                        try { m = t.GetMethod(paramMethodNames[mi], bindFlags); }
+                        catch { continue; }
+                        if ((object)m == null) continue;
+                        if (!ReferenceEquals(m.ReturnType, typeof(void))) continue;
+                        asmMethods++;
+                        try
+                        {
+                            harmony.Patch(m, prefix, postfix);
+                            KeyMap[m] = t.Name + "." + paramMethodNames[mi];
+                            asmPatched++;
+                        }
+                        catch { failed++; }
+                    }
+
+                    // Coroutines: compiler-generated iterator state machines nested in this type.
+                    // Their MoveNext IS the coroutine body — the main blind spot of Update-only
+                    // profiling.
+                    Type[] nested;
+                    try { nested = t.GetNestedTypes(BindingFlags.Public | BindingFlags.NonPublic); }
+                    catch { nested = Type.EmptyTypes; }
+                    for (int ni = 0; ni < nested.Length; ni++)
+                    {
+                        var nt = nested[ni];
+                        if (!typeof(System.Collections.IEnumerator).IsAssignableFrom(nt)) continue;
+                        MethodInfo mn;
+                        try { mn = nt.GetMethod("MoveNext", bindFlags); }
+                        catch { continue; }
+                        if ((object)mn == null) continue;
+                        asmMethods++;
+                        try
+                        {
+                            harmony.Patch(mn, prefix, postfix);
+                            // "<LoadLevel>c__Iterator7" -> "SceneManagerScript.LoadLevel[co]"
+                            string co = nt.Name;
+                            int lt = co.IndexOf('<');
+                            int gt = co.IndexOf('>');
+                            if (lt >= 0 && gt > lt) co = co.Substring(lt + 1, gt - lt - 1);
+                            KeyMap[mn] = t.Name + "." + co + "[co]";
+                            asmPatched++;
+                        }
+                        catch { failed++; }
                     }
                 }
 
