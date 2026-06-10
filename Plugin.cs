@@ -363,6 +363,48 @@ namespace RedAllianceSpeedrun
                     }
                     Logger.LogMessage(sb.ToString());
 
+                    // Locate the top grown types: histogram of where their instances live
+                    // (scene/rootObject, or asset/hidden if not in a loaded scene). Distinguishes
+                    // a scene-object leak from assets pinned in memory.
+                    int locTypes = Math.Min(5, grown.Count);
+                    for (int t = 0; t < locTypes; t++)
+                    {
+                        string typeName = grown[t].Key;
+                        var locCounts = new Dictionary<string, int>(16);
+                        for (int i = 0; i < allComps.Length; i++)
+                        {
+                            var c = allComps[i];
+                            if (c == null || c.GetType().Name != typeName) continue;
+                            string loc;
+                            var go = c.gameObject;
+                            var s = go.scene;
+                            if (s.IsValid())
+                            {
+                                var tr = go.transform;
+                                while (tr.parent != null) tr = tr.parent;
+                                loc = s.name + "/" + tr.name + (go.activeInHierarchy ? "" : "(off)");
+                            }
+                            else
+                            {
+                                loc = "asset/hidden(hideFlags=" + go.hideFlags + ")";
+                            }
+                            int v;
+                            locCounts.TryGetValue(loc, out v);
+                            locCounts[loc] = v + 1;
+                        }
+                        var locs = new List<KeyValuePair<string, int>>(locCounts);
+                        locs.Sort((a, b) => b.Value.CompareTo(a.Value));
+                        var lb = new System.Text.StringBuilder();
+                        lb.Append($"[delta-loc {tag} #{_deltaSampleCount}] {typeName}: ");
+                        int topL = Math.Min(6, locs.Count);
+                        for (int i = 0; i < topL; i++)
+                        {
+                            if (i > 0) lb.Append(", ");
+                            lb.Append(locs[i].Key).Append("=").Append(locs[i].Value);
+                        }
+                        Logger.LogMessage(lb.ToString());
+                    }
+
                     // Grown DDOL roots.
                     var ddolGrown = new List<string>();
                     foreach (var kv in ddolCounts)
