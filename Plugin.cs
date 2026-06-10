@@ -119,22 +119,22 @@ namespace RedAllianceSpeedrun
                 "Hotkeys", "ProfilerDumpKey", KeyCode.F9,
                 "Dumps the InvokeRepeating profiler stats: which periodic callbacks have eaten the most CPU since last dump. Resets counters after each dump. (F10 is sometimes captured by the OS, F9 is safer.)");
             _invokeRepeatingProfilerEnabled = Config.Bind(
-                "Diagnostics", "InvokeRepeatingProfiler", true,
+                "Diagnostics", "InvokeRepeatingProfiler", false,
                 "Time every call to common ~1-second InvokeRepeating callbacks (GlobalAIScript, LightDistanceCullingScript, ObjectDisableScript, FootStepsScriptNew, AILightHeightOptimizationScript). F11 dumps top consumers.");
             _updateProfilerEnabled = Config.Bind(
-                "Diagnostics", "UpdateProfiler", true,
+                "Diagnostics", "UpdateProfiler", false,
                 "Patch Update/LateUpdate/FixedUpdate of EVERY game MonoBehaviour subclass with a Stopwatch timer. Heavy (patches 50-100+ methods) but reveals which per-frame method actually takes time. F11 dumps top consumers.");
             _diagOnReload = Config.Bind(
-                "Diagnostics", "LogOnLevelLoad", true,
+                "Diagnostics", "LogOnLevelLoad", false,
                 "Log RT/material/audio/DDOL counts after every scene load.");
             _deltaOnReload = Config.Bind(
-                "Diagnostics", "DeltaOnLevelLoad", true,
+                "Diagnostics", "DeltaOnLevelLoad", false,
                 "After each gameplay scene load, census component-type counts + DDOL-root component " +
                 "counts and log ONLY what GREW since the previous restart ([delta] lines). A type that " +
                 "climbs by a constant amount every restart is a leak. Removes need for manual F12 diffing. " +
                 "Adds one full-object census per load (~deep-diag cost); set false to disable.");
             _orphanPrefabSweep = Config.Bind(
-                "LeakFix", "OrphanPrefabSweep", true,
+                "LeakFix", "OrphanPrefabSweep", false,
                 "Each Transfer-mode restart strands a full copy of the player and _Canvas_Player " +
                 "prefab templates in asset space (outside any scene), where scene reloads never " +
                 "destroy them and UnloadUnusedAssets cannot free them (lingering managed refs). " +
