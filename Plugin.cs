@@ -47,6 +47,10 @@ namespace RedAllianceSpeedrun
         private int _prevTotalGO = -1;
         private int _prevTotalComp = -1;
         private int _deltaSampleCount;
+        // Baseline (first census) totals: cumulative drift vs these is the true leak signal;
+        // per-restart deltas oscillate with load/unload timing.
+        private int _baseTotalGO = -1;
+        private int _baseTotalComp = -1;
 
         // Cached references to current NetworkManager's Steam callbacks. We hold these alive
         // ourselves to prevent finalizer races, and Dispose them explicitly when a new
@@ -79,9 +83,12 @@ namespace RedAllianceSpeedrun
         private int _restartCount;
         private int _frameInWindow;
 
-        // Allocation-rate sample (KB/sec, derived from Profiler.GetMonoUsedSizeLong deltas)
+        // Allocation-rate sample (KB/sec). Positive per-frame deltas of GC.GetTotalMemory are
+        // accumulated; sampling once per second misses everything a GC already collected inside
+        // the window, which underreports badly when GCs run several times per second.
         private float _allocLastSampleTime;
-        private long _allocLastBytes;
+        private long _allocPrevFrameBytes;
+        private long _allocAccumBytes;
         private float _lastAllocKbPerSec;
         private float _lastGcPerSec;
         private int _lastGcCount;
@@ -429,6 +436,8 @@ namespace RedAllianceSpeedrun
 
                 if (_prevCompCounts == null)
                 {
+                    _baseTotalGO = totalGO;
+                    _baseTotalComp = totalComp;
                     Logger.LogMessage(
                         $"[delta {tag}] baseline #{_deltaSampleCount}: GO={totalGO} Comp={totalComp} " +
                         $"ddolRoots={ddolCounts.Count}. Restart again to see growth.");
@@ -437,6 +446,13 @@ namespace RedAllianceSpeedrun
                 {
                     int dGO = totalGO - _prevTotalGO;
                     int dComp = totalComp - _prevTotalComp;
+                    // Cumulative drift vs baseline + perf trend: the one line that matters for
+                    // "does it degrade per restart". Flat cum + rising gc/s = allocation problem,
+                    // not an object leak.
+                    Logger.LogMessage(
+                        $"[delta-cum {tag} #{_deltaSampleCount}] vs baseline: dGO={totalGO - _baseTotalGO:+#;-#;0} " +
+                        $"dComp={totalComp - _baseTotalComp:+#;-#;0}  perf: fps={_lastFps:F1} gc/s={_lastGcPerSec:F1} " +
+                        $"alloc={_lastAllocKbPerSec:F0}KB/s p99={_lastFrameP99Ms:F1}ms");
 
                     // Grown component types, by descending delta.
                     var grown = new List<KeyValuePair<string, int>>();
@@ -733,6 +749,16 @@ namespace RedAllianceSpeedrun
             int gcDelta = gcNowSample - _lastGcSampleCount;
             _lastGcSampleCount = gcNowSample;
 
+            // Accumulate this frame's managed allocation (positive heap delta only; a GC inside
+            // the frame makes the delta negative, which we ignore — we measure allocation, not
+            // survival).
+            long heapNow = GC.GetTotalMemory(false);
+            if (heapNow > _allocPrevFrameBytes)
+            {
+                _allocAccumBytes += heapNow - _allocPrevFrameBytes;
+            }
+            _allocPrevFrameBytes = heapNow;
+
             // Per-spike trace: log individual frames that exceed the threshold
             float spikeThreshold = _spikeLogThresholdMs != null ? _spikeLogThresholdMs.Value : 50f;
             if (spikeThreshold > 0f && frameMs > spikeThreshold)
@@ -757,22 +783,17 @@ namespace RedAllianceSpeedrun
             float now = Time.unscaledTime;
             if (now - _allocLastSampleTime >= 1f)
             {
-                long monoNow = 0;
-                try { monoNow = Profiler.GetMonoUsedSizeLong(); } catch { }
                 int gcNow = GC.CollectionCount(0);
 
                 if (_allocLastSampleTime > 0f)
                 {
                     float dt = now - _allocLastSampleTime;
-                    long delta = monoNow - _allocLastBytes;
-                    // If GC ran during this window, the delta can be negative; clamp.
-                    if (delta < 0) delta = 0;
-                    _lastAllocKbPerSec = (delta / 1024f) / dt;
+                    _lastAllocKbPerSec = (_allocAccumBytes / 1024f) / dt;
                     _lastGcPerSec = (gcNow - _lastGcCount) / dt;
                     _lastLogsPerSec = (int)(_logCountThisWindow / dt);
                 }
 
-                _allocLastBytes = monoNow;
+                _allocAccumBytes = 0;
                 _allocLastSampleTime = now;
                 _lastGcCount = gcNow;
                 _logCountThisWindow = 0;
