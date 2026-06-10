@@ -35,6 +35,7 @@ namespace RedAllianceSpeedrun
         private ConfigEntry<bool> _disposeOrphanSteamCallbacks;
         private ConfigEntry<bool> _deltaOnReload;
         private ConfigEntry<bool> _orphanPrefabSweep;
+        private ConfigEntry<bool> _tonemappingLutFix;
 
         private bool _devConsoleUnsubscribed;
 
@@ -141,6 +142,13 @@ namespace RedAllianceSpeedrun
                 "scan into 200-400ms spikes. This sweep destroys duplicate asset-space templates " +
                 "after each load, keeping only those referenced by the live NetworkManager and " +
                 "PlayerStatsSp.");
+            _tonemappingLutFix = Config.Bind(
+                "LeakFix", "TonemappingLutFix", true,
+                "TonemappingColorGrading.OnRenderImage regenerates its LUT every frame in fastMode " +
+                "(Create1DLut never assigns m_LutTex, so the 'm_LutTex == null' rebuild check stays " +
+                "true forever): a Color[] allocation + SetPixels + GPU upload per frame, ~10MB of " +
+                "managed churn per thousand frames, driving Boehm GC to 10+ collections/sec. " +
+                "Install a marker texture after UpdateLut so the LUT is only rebuilt when dirty.");
             _restartInMenu = Config.Bind(
                 "Hotkeys", "RestartInMenu", false,
                 "If false, the restart key is ignored when the active scene is main_menu, credits, or start_screen.");
@@ -192,6 +200,20 @@ namespace RedAllianceSpeedrun
                 catch (Exception e)
                 {
                     Logger.LogError("[steamfix] Failed to install Harmony patch: " + e);
+                }
+            }
+
+            if (_tonemappingLutFix.Value)
+            {
+                try
+                {
+                    var harmony = new Harmony(GUID + ".lutfix");
+                    harmony.PatchAll(typeof(TonemappingLutFixPatch));
+                    Logger.LogInfo("[lutfix] Harmony patch installed on TonemappingColorGrading.UpdateLut.");
+                }
+                catch (Exception e)
+                {
+                    Logger.LogError("[lutfix] Failed to install Harmony patch: " + e);
                 }
             }
 
