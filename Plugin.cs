@@ -12,7 +12,7 @@ using UnityEngine.SceneManagement;
 
 namespace RedAllianceSpeedrun
 {
-    [BepInPlugin(GUID, "Red Alliance Speedrun Tools", "0.19.0")]
+    [BepInPlugin(GUID, "Red Alliance Speedrun Tools", "0.20.0")]
     public class Plugin : BaseUnityPlugin
     {
         public const string GUID = "redalliance.speedrun";
@@ -37,16 +37,8 @@ namespace RedAllianceSpeedrun
         private ConfigEntry<bool> _updateProfilerEnabled;
         private ConfigEntry<bool> _diagOnReload;
         private ConfigEntry<bool> _restartInMenu;
-        private ConfigEntry<bool> _leakFixEnabled;
-        private ConfigEntry<int> _leakFixDelayFrames;
-        private ConfigEntry<bool> _consoleLogLeakFix;
-        private ConfigEntry<bool> _aggressiveGcOnLoad;
-        private ConfigEntry<bool> _disposeOrphanSteamCallbacks;
         private ConfigEntry<bool> _deltaOnReload;
         private ConfigEntry<bool> _orphanPrefabSweep;
-        private ConfigEntry<bool> _tonemappingLutFix;
-        private ConfigEntry<bool> _playerGraphThreadFix;
-        private ConfigEntry<bool> _disableGuiLayoutPass;
 
         // --- Speedrun tools (ported from the v1.4 plugin; clip/movement mechanics and
         // SpeedrunMode deliberately NOT ported — different game build, not needed here) ---
@@ -87,8 +79,6 @@ namespace RedAllianceSpeedrun
         private GUIStyle _timerStyle;
         private GUIStyle _timerShadowStyle;
 
-        private bool _devConsoleUnsubscribed;
-
         // Previous-restart census snapshots, for the auto-delta leak logger. Each restart we
         // census component-type counts and DDOL-root component counts, then log only what GREW
         // since the previous restart. A type that climbs by a constant amount every restart is
@@ -102,14 +92,6 @@ namespace RedAllianceSpeedrun
         // per-restart deltas oscillate with load/unload timing.
         private int _baseTotalGO = -1;
         private int _baseTotalComp = -1;
-
-        // Cached references to current NetworkManager's Steam callbacks. We hold these alive
-        // ourselves to prevent finalizer races, and Dispose them explicitly when a new
-        // NetworkManager creates fresh ones. This eliminates pinned-GCHandle accumulation
-        // that fragments the Mono heap across Transfer-mode restarts.
-        internal static IDisposable s_prevOverlayCallback;
-        internal static IDisposable s_prevPlayerCountCallback;
-        internal static int s_steamCallbackDisposeCount;
 
         // FPS sample
         private float _fpsAccum;
@@ -193,103 +175,16 @@ namespace RedAllianceSpeedrun
                 "scan into 200-400ms spikes. This sweep destroys duplicate asset-space templates " +
                 "after each load, keeping only those referenced by the live NetworkManager and " +
                 "PlayerStatsSp.");
-            _tonemappingLutFix = Config.Bind(
-                "LeakFix", "TonemappingLutFix", true,
-                "TonemappingColorGrading.OnRenderImage regenerates its LUT every frame in fastMode " +
-                "(Create1DLut never assigns m_LutTex, so the 'm_LutTex == null' rebuild check stays " +
-                "true forever): a Color[] allocation + SetPixels + GPU upload per frame, ~10MB of " +
-                "managed churn per thousand frames, driving Boehm GC to 10+ collections/sec. " +
-                "Install a marker texture after UpdateLut so the LUT is only rebuilt when dirty.");
-            _playerGraphThreadFix = Config.Bind(
-                "LeakFix", "PlayerGraphThreadFix", true,
-                "PlayerGraphScript.Start spawns 'new Thread(Count)' whose body is an infinite loop " +
-                "calling GC.GetTotalMemory(forceFullCollection: TRUE) every second - a forced full " +
-                "blocking GC. The thread has no exit condition and outlives its GameObject, and the " +
-                "stats canvas is recreated on every level load, so each restart permanently adds one " +
-                "more GC-forcing thread (gc/s grows ~1 per restart; the game stutters after 20-30 " +
-                "loads). Replace the loop: generation-tagged so superseded threads exit, and the " +
-                "memory stat is read without forcing a collection.");
             _restartInMenu = Config.Bind(
                 "Hotkeys", "RestartInMenu", false,
                 "If false, the restart key is ignored when the active scene is main_menu, credits, or start_screen.");
-            _leakFixEnabled = Config.Bind(
-                "LeakFix", "Enabled", true,
-                "Sweep orphan post-effect materials after every scene load. Fixes the " +
-                "+4-materials-per-restart leak caused by PostEffectBaseNew / GlobalFog / " +
-                "Vignetting / NoiseAndGrain / ColorCorrectionCurves / Antialiasing scripts " +
-                "flagging their materials DontUnloadUnusedAsset without an OnDisable cleanup.");
-            _leakFixDelayFrames = Config.Bind(
-                "LeakFix", "DelayFrames", 2,
-                "How many frames to wait after sceneLoaded before sweeping. " +
-                "Lets the new scene's Awake/Start run so live materials are referenced.");
-            _consoleLogLeakFix = Config.Bind(
-                "LeakFix", "UnsubscribeDevConsoleLog", true,
-                "Unsubscribe DeveloperConsoleScript.HandleLog from Application.logMessageReceived " +
-                "and clear its consoleMessages list on every scene load. Eliminates a growing " +
-                "static list that accumulates ~6 Debug.Log messages per restart.");
-            _aggressiveGcOnLoad = Config.Bind(
-                "LeakFix", "AggressiveGCOnLoad", true,
-                "After each scene load, force a full GC + WaitForPendingFinalizers + a second GC. " +
-                "The game's own LoadLevel calls GC.Collect but not WaitForPendingFinalizers, so " +
-                "orphaned objects with finalizers (Steam Callback<T>, IDisposables) may persist " +
-                "in pinned state across restarts and fragment the Mono heap, increasing GC " +
-                "frequency over time. This forces the cleanup synchronously.");
             _spikeLogThresholdMs = Config.Bind(
                 "Diagnostics", "SpikeLogThresholdMs", 50f,
                 "Log every individual frame whose duration exceeds this many ms, with timing " +
                 "relative to the last scene load. Set to 0 to disable.");
-            _disposeOrphanSteamCallbacks = Config.Bind(
-                "LeakFix", "DisposeOrphanSteamCallbacks", true,
-                "Hook NetworkManager.OnEnable to explicitly Dispose the previous NetworkManager's " +
-                "Steam Callback<T> objects when a new NetworkManager replaces it. The game itself " +
-                "relies on Mono's finalizer to clean these up, but on a fragmented heap the " +
-                "finalizer can lag, leaving pinned GCHandles that further fragment the heap and " +
-                "accelerate GC frequency. Explicit disposal eliminates this source of leakage.");
 
             SceneManager.sceneLoaded += OnSceneLoaded;
             Application.logMessageReceived += OnLogCount;
-
-            if (_disposeOrphanSteamCallbacks.Value)
-            {
-                try
-                {
-                    var harmony = new Harmony(GUID);
-                    harmony.PatchAll(typeof(NetworkManagerSteamCallbackPatch));
-                    Logger.LogInfo("[steamfix] Harmony patch installed on NetworkManager.OnEnable.");
-                }
-                catch (Exception e)
-                {
-                    Logger.LogError("[steamfix] Failed to install Harmony patch: " + e);
-                }
-            }
-
-            if (_tonemappingLutFix.Value)
-            {
-                try
-                {
-                    var harmony = new Harmony(GUID + ".lutfix");
-                    harmony.PatchAll(typeof(TonemappingLutFixPatch));
-                    Logger.LogInfo("[lutfix] Harmony patch installed on TonemappingColorGrading.UpdateLut.");
-                }
-                catch (Exception e)
-                {
-                    Logger.LogError("[lutfix] Failed to install Harmony patch: " + e);
-                }
-            }
-
-            if (_playerGraphThreadFix.Value)
-            {
-                try
-                {
-                    var harmony = new Harmony(GUID + ".graphfix");
-                    harmony.PatchAll(typeof(PlayerGraphThreadFixPatch));
-                    Logger.LogInfo("[graphfix] Harmony patch installed on PlayerGraphScript.Count.");
-                }
-                catch (Exception e)
-                {
-                    Logger.LogError("[graphfix] Failed to install Harmony patch: " + e);
-                }
-            }
 
             if (_invokeRepeatingProfilerEnabled.Value)
             {
@@ -326,82 +221,23 @@ namespace RedAllianceSpeedrun
                 }
             }
 
-            // InputManager.Update optimization disabled in v0.17.1 — broke player movement
-            // in v0.17.0. Will revisit with a non-replacement approach later.
-
-            // Rope offscreen skip — the catenary recompute was the #1 Update-time consumer
-            // in every profiling session; ropes outside the camera frustum don't need it.
-            var ropeOpt = Config.Bind(
-                "Optimizations", "SkipOffscreenRopes", true,
-                "Skip LineRendererRopeScript's per-frame catenary recomputation while the rope's " +
-                "LineRenderer is not visible to any camera. Wind animation is a continuous function " +
-                "of time, so ropes re-entering view continue seamlessly. Purely visual script.");
-            if (ropeOpt.Value)
+            // All freeze fixes and CPU optimizations live in the separate
+            // "Red Alliance v1.3 Optimization Fix" plugin (redalliance.optimizationfix)
+            // since v0.20.0, so both plugins can be installed side by side without
+            // double-patching. Warn if it's missing — without it the game's own bugs
+            // (immortal GC threads, per-frame LUT rebuild) make it stutter after
+            // 20-30 level loads, which ruins long speedrun sessions.
+            try
             {
-                try
+                if (!BepInEx.Bootstrap.Chainloader.PluginInfos.ContainsKey("redalliance.optimizationfix"))
                 {
-                    var harmony = new Harmony(GUID + ".ropefix");
-                    harmony.PatchAll(typeof(RopeVisibilityPatch));
-                    Logger.LogInfo("[ropefix] Patched LineRendererRopeScript.GenerateRope (offscreen skip).");
-                }
-                catch (Exception e)
-                {
-                    Logger.LogError("[ropefix] Failed to patch: " + e);
+                    Logger.LogWarning(
+                        "[deps] 'Red Alliance v1.3 Optimization Fix' (RedAllianceOptimizationFix.dll) is NOT " +
+                        "installed. The game will progressively freeze after ~20-30 level loads due to its " +
+                        "own bugs. Strongly recommended for speedrun sessions.");
                 }
             }
-
-            _disableGuiLayoutPass = Config.Bind(
-                "Optimizations", "DisableGUILayoutPass", true,
-                "Legacy IMGUI calls every OnGUI twice per frame (Layout + Repaint) and allocates " +
-                "an Event object per pass (~1KB/call measured on PlayerGraphScript alone). " +
-                "PlayerGraphScript and CrosshairScript only use direct GUI.* calls with explicit " +
-                "Rects - the Layout pass is pure waste for them. Set useGUILayout=false on those " +
-                "components after each scene load. FadeScript and SceneManagerScript are excluded: " +
-                "disabling their Layout pass stopped the loading-screen progress bar and the " +
-                "'press any key' prompt from rendering, and their OnGUI cost is negligible. " +
-                "DeveloperConsoleScript uses GUILayout and is left untouched.");
-
-            var alertInterval = Config.Bind(
-                "Optimizations", "AlertCheckFrameInterval", 2,
-                "OnEnemyKilledAllertEnemiesScript polls its entire NPC array every frame " +
-                "(distance checks per NPC, ~258us/frame measured in combat) waiting for an alert " +
-                "condition. Run the poll every Nth frame instead, staggered per instance. " +
-                "Worst-case extra reaction latency at N=2 is one frame (~10-20ms) - imperceptible. " +
-                "1 disables throttling.");
-            if (alertInterval.Value > 1)
-            {
-                try
-                {
-                    AlertCheckThrottlePatch.Interval = alertInterval.Value;
-                    var harmony = new Harmony(GUID + ".alertfix");
-                    harmony.PatchAll(typeof(AlertCheckThrottlePatch));
-                    Logger.LogInfo($"[alertfix] Alert poll throttled to every {alertInterval.Value} frames.");
-                }
-                catch (Exception e)
-                {
-                    Logger.LogError("[alertfix] Failed to patch: " + e);
-                }
-            }
-
-            // WaterPhysicsScript.FloatObjects replacement — opt-in
-            var waterOpt = Config.Bind(
-                "Optimizations", "PatchWaterPhysics", false,
-                "Replace WaterPhysicsScript.FloatObjects with an alloc-free, O(N) version. " +
-                "The original uses LINQ ElementAt(i) which is O(N²) and allocates per call. " +
-                "Test carefully — physics behaviour should match but if anything looks off, set false.");
-            if (waterOpt.Value)
-            {
-                try
-                {
-                    var harmony = new Harmony(GUID + ".waterfix");
-                    harmony.PatchAll(typeof(WaterPhysicsFloatObjectsPatch));
-                    Logger.LogInfo("[waterfix] Patched WaterPhysicsScript.FloatObjects.");
-                }
-                catch (Exception e)
-                {
-                    Logger.LogError("[waterfix] Failed to patch: " + e);
-                }
-            }
+            catch { /* chainloader not ready — ignore */ }
 
             // --- Speedrun tools (ported from v1.4 plugin) ---
             _fpsToggleKey = Config.Bind(
@@ -506,7 +342,7 @@ namespace RedAllianceSpeedrun
 
             ApplyFpsCap();
 
-            Logger.LogInfo($"Restart key: {_restartKey.Value}; Diag key: {_diagKey.Value}; Menu key: {_menuToggleKey.Value}; LeakFix: {_leakFixEnabled.Value}");
+            Logger.LogInfo($"Restart key: {_restartKey.Value}; Diag key: {_diagKey.Value}; Menu key: {_menuToggleKey.Value}");
         }
 
         // Copies ConfigEntry.Value into the internal static fields. Called by Awake (after
@@ -574,14 +410,9 @@ namespace RedAllianceSpeedrun
                 _restartCount++;
             }
 
-            if (_consoleLogLeakFix != null && _consoleLogLeakFix.Value)
+            if (_diagOnReload != null && _diagOnReload.Value)
             {
-                ApplyDevConsoleLogLeakFix();
-            }
-
-            if (_aggressiveGcOnLoad != null && _aggressiveGcOnLoad.Value)
-            {
-                ApplyAggressiveGC();
+                LogDiagnostics("post-load:" + scene.name);
             }
 
             // Don't touch early-startup scenes: anything we sweep here can take the loading
@@ -591,25 +422,11 @@ namespace RedAllianceSpeedrun
                 scene.name == "object_pool" ||
                 scene.name == "main_menu" ||
                 scene.name == "credits";
-            if (!earlyScene && _leakFixEnabled != null && _leakFixEnabled.Value)
-            {
-                StartCoroutine(SweepAfterLoad(scene.name));
-            }
-            else if (_diagOnReload != null && _diagOnReload.Value)
-            {
-                LogDiagnostics("post-load:" + scene.name);
-            }
-
             if (!earlyScene &&
                 ((_deltaOnReload != null && _deltaOnReload.Value) ||
                  (_orphanPrefabSweep != null && _orphanPrefabSweep.Value)))
             {
                 StartCoroutine(DeltaAfterLoad(scene.name));
-            }
-
-            if (_disableGuiLayoutPass != null && _disableGuiLayoutPass.Value)
-            {
-                StartCoroutine(DisableGuiLayoutAfterLoad());
             }
 
             ApplyCheatGate();
@@ -711,7 +528,7 @@ namespace RedAllianceSpeedrun
                 string[] header = new[]
                 {
                     "===== [RACFG-DUMP-BEGIN] =====",
-                    $"plugin_version=0.19.0",
+                    $"plugin_version=0.20.0",
                     $"game_version=1.3",
                     $"rta={_rta.Format()}",
                     $"igt={_igt.Format()}",
@@ -738,35 +555,6 @@ namespace RedAllianceSpeedrun
             Logger.LogMessage(line);
             try { DeveloperConsoleScript.AddConsoleMessage(line); }
             catch { /* console may not be initialized */ }
-        }
-
-        // Turn off the IMGUI Layout pass on OnGUI scripts that only use direct GUI.* calls.
-        // Halves their OnGUI invocations and removes the per-pass Event allocation. Runs a few
-        // frames after load so the scene's singletons exist.
-        private IEnumerator DisableGuiLayoutAfterLoad()
-        {
-            for (int i = 0; i < 5; i++) yield return null;
-            int n = 0;
-            try
-            {
-                var graph = FindObjectOfType<PlayerGraphScript>();
-                if ((bool)graph && graph.useGUILayout) { graph.useGUILayout = false; n++; }
-                var cross = FindObjectOfType<CrosshairScript>();
-                if ((bool)cross && cross.useGUILayout) { cross.useGUILayout = false; n++; }
-                // FadeScript / SceneManagerScript intentionally excluded: with useGUILayout=false
-                // their loading-screen overlay (progress bar, "press any key") stopped rendering.
-                // Both are DontDestroyOnLoad singletons, so also undo the flag if a previous
-                // plugin version already cleared it on them.
-                var fade = FindObjectOfType<FadeScript>();
-                if ((bool)fade && !fade.useGUILayout) { fade.useGUILayout = true; }
-                var smgr = SceneManagerScript.Instance;
-                if ((bool)smgr && !smgr.useGUILayout) { smgr.useGUILayout = true; }
-            }
-            catch (Exception e)
-            {
-                Logger.LogError("[guifix] failed: " + e);
-            }
-            if (n > 0) Logger.LogDebug($"[guifix] disabled GUI layout pass on {n} component(s).");
         }
 
         // Wait for the scene to fully settle (past the load-spike burst), then sweep orphan
@@ -1053,138 +841,6 @@ namespace RedAllianceSpeedrun
                 Destroy(probe);
             }
             return result;
-        }
-
-        private void ApplyAggressiveGC()
-        {
-            try
-            {
-                long beforeMb = GC.GetTotalMemory(false) / (1024L * 1024L);
-                int beforeGc = GC.CollectionCount(0);
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
-                GC.Collect();
-                Resources.UnloadUnusedAssets();
-                sw.Stop();
-                long afterMb = GC.GetTotalMemory(false) / (1024L * 1024L);
-                int afterGc = GC.CollectionCount(0);
-                Logger.LogDebug($"[gcfix] {sw.ElapsedMilliseconds}ms  mono {beforeMb}->{afterMb}MB  gc+={afterGc - beforeGc}");
-            }
-            catch (Exception e)
-            {
-                Logger.LogError("Aggressive GC failed: " + e);
-            }
-        }
-
-        private void ApplyDevConsoleLogLeakFix()
-        {
-            try
-            {
-                if (!_devConsoleUnsubscribed)
-                {
-                    // Application.logMessageReceived -= DeveloperConsoleScript.HandleLog
-                    // Done once. Static field `invokedConsoleReading` stays true so the game's
-                    // own Start() will not re-subscribe.
-                    Application.logMessageReceived -= DeveloperConsoleScript.HandleLog;
-                    _devConsoleUnsubscribed = true;
-                    Logger.LogInfo("[consolefix] HandleLog unsubscribed from Application.logMessageReceived.");
-                }
-
-                // Clear the static consoleMessages list every load. Reflection because field is private.
-                var f = typeof(DeveloperConsoleScript).GetField("consoleMessages",
-                    BindingFlags.Static | BindingFlags.NonPublic);
-                if ((object)f != null)
-                {
-                    var list = f.GetValue(null) as System.Collections.IList;
-                    if (list != null && list.Count > 0)
-                    {
-                        int before = list.Count;
-                        list.Clear();
-                        Logger.LogDebug($"[consolefix] consoleMessages cleared ({before} entries).");
-                    }
-                }
-            }
-            catch (Exception e)
-            {
-                Logger.LogError("Dev console log leak fix failed: " + e);
-            }
-        }
-
-        private IEnumerator SweepAfterLoad(string sceneName)
-        {
-            int wait = Math.Max(0, _leakFixDelayFrames.Value);
-            for (int i = 0; i < wait; i++) yield return null;
-
-            int cleared = 0;
-            int destroyed = 0;
-            try
-            {
-                int before = Resources.FindObjectsOfTypeAll<Material>().Length;
-
-                var mats = Resources.FindObjectsOfTypeAll<Material>();
-                for (int i = 0; i < mats.Length; i++)
-                {
-                    var m = mats[i];
-                    if (m == null) continue;
-                    if (!IsLeakCandidate(m)) continue;
-                    if ((m.hideFlags & HideFlags.DontUnloadUnusedAsset) == 0) continue;
-                    m.hideFlags &= ~HideFlags.DontUnloadUnusedAsset;
-                    cleared++;
-                }
-
-                if (cleared > 0)
-                {
-                    var op = Resources.UnloadUnusedAssets();
-                    while (!op.isDone) yield return null;
-                    int after = Resources.FindObjectsOfTypeAll<Material>().Length;
-                    destroyed = before - after;
-                }
-            }
-            finally
-            {
-                if (cleared > 0)
-                    Logger.LogDebug($"[leakfix] scene='{sceneName}'  flagged={cleared}  freed={destroyed}");
-            }
-
-            if (_diagOnReload != null && _diagOnReload.Value)
-                LogDiagnostics("post-load:" + sceneName);
-        }
-
-        // Narrow allowlist — only the post-effect shaders fed through PostEffectBaseNew
-        // and similar leak-prone helpers. Other "Hidden/" shaders (decals, particles,
-        // skybox, UI internals) are gameplay-critical and must not be touched.
-        private static readonly string[] LeakShaderSubstrings = new[]
-        {
-            "Hidden/ColorCorrectionCurves",
-            "Hidden/ColorCorrectionCurvesSimple",
-            "Hidden/ColorCorrectionSelective",
-            "Hidden/VignettingShader",
-            "Hidden/Vignetting",
-            "Hidden/SeparableBlur",
-            "Hidden/ChromaticAberration",
-            "Hidden/NoiseAndGrain",
-            "Hidden/FXAAPreset",
-            "Hidden/FXAA",
-            "Hidden/NFAA",
-            "Hidden/SSAA",
-            "Hidden/DLAA",
-            "Hidden/GlobalFog",
-            "Hidden/CameraMotionBlur",
-        };
-
-        private static bool IsLeakCandidate(Material m)
-        {
-            var s = m.shader;
-            if (s == null) return false;
-            var name = s.name;
-            if (string.IsNullOrEmpty(name)) return false;
-            for (int i = 0; i < LeakShaderSubstrings.Length; i++)
-            {
-                if (name.IndexOf(LeakShaderSubstrings[i], StringComparison.Ordinal) >= 0)
-                    return true;
-            }
-            return false;
         }
 
         private int _lastGcSampleCount;
@@ -2042,13 +1698,6 @@ namespace RedAllianceSpeedrun
             int spikes = 0;
             for (int i = 0; i < n; i++) if (snap[i] > 33f) spikes++;
             _lastFrameSpikeCount = spikes;
-        }
-
-        // Reset cached callback refs to null without disposing — used if we hit a state issue.
-        internal static void ClearSteamCallbackCache()
-        {
-            s_prevOverlayCallback = null;
-            s_prevPlayerCountCallback = null;
         }
 
         private static int CountDontDestroyOnLoad()
