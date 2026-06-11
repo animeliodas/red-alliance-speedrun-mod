@@ -12,13 +12,22 @@ using UnityEngine.SceneManagement;
 
 namespace RedAllianceSpeedrun
 {
-    [BepInPlugin(GUID, "Red Alliance Speedrun Tools", "0.18.1")]
+    [BepInPlugin(GUID, "Red Alliance Speedrun Tools", "0.19.0")]
     public class Plugin : BaseUnityPlugin
     {
         public const string GUID = "redalliance.speedrun";
 
         internal static Plugin Instance;
         internal new static ManualLogSource Logger;
+        internal static ConfigFile ConfigRef;
+
+        // Statics mirrored from ConfigEntries (see SyncStatics) so RaMenu / racfg edits
+        // apply without restart.
+        internal static bool PracticeMode;
+        internal static bool LiveSplitEnabled;
+        internal static string LiveSplitHost;
+        internal static int LiveSplitPort;
+        internal static float LiveSplitSyncRate;
 
         private ConfigEntry<KeyCode> _restartKey;
         private ConfigEntry<KeyCode> _diagKey;
@@ -38,6 +47,45 @@ namespace RedAllianceSpeedrun
         private ConfigEntry<bool> _tonemappingLutFix;
         private ConfigEntry<bool> _playerGraphThreadFix;
         private ConfigEntry<bool> _disableGuiLayoutPass;
+
+        // --- Speedrun tools (ported from the v1.4 plugin; clip/movement mechanics and
+        // SpeedrunMode deliberately NOT ported — different game build, not needed here) ---
+        private ConfigEntry<KeyCode> _fpsToggleKey;
+        private ConfigEntry<KeyCode> _menuToggleKey;
+        private ConfigEntry<bool> _fpsLockEnabled;
+        private ConfigEntry<int> _standartFPS;
+        private ConfigEntry<int> _minFPS;
+        private bool _fpsLow;
+        private ConfigEntry<string> _restartLevel;
+        private ConfigEntry<bool> _restartSetDifficulty;
+        private ConfigEntry<int> _restartDifficultyValue;
+        private ConfigEntry<bool> _practiceMode;
+        private ConfigEntry<bool> _livesplitEnabled;
+        private ConfigEntry<string> _livesplitHost;
+        private ConfigEntry<int> _livesplitPort;
+        private ConfigEntry<float> _livesplitSyncRate;
+        private ConfigEntry<string> _livesplitSplitScenes;
+        private ConfigEntry<bool> _livesplitSplitOnLevelChange;
+        private ConfigEntry<bool> _showTimers;
+        private ConfigEntry<bool> _skipPrison1;
+        private ConfigEntry<int> _timerScreenX;
+        private ConfigEntry<int> _timerScreenY;
+        private ConfigEntry<int> _timerFontSize;
+        private ConfigEntry<string> _runEndScene;
+
+        // Timer state
+        private readonly SpeedrunTimer _rta = new SpeedrunTimer("RTA", false, false);
+        private readonly SpeedrunTimer _igt = new SpeedrunTimer("IGT", true, true);
+        private bool _waitingForLoadComplete; // after TAB, start timers when load completes
+        private bool _runIsActive;            // true between run start and RunEndScene load
+        private string _pendingStartScene;    // timer starts when this scene finishes loading
+        private float _livesplitNextSyncTime;
+        private string[] _livesplitSplitSceneList;
+        private string _livesplitLastSplitScene;
+
+        // GUI cache
+        private GUIStyle _timerStyle;
+        private GUIStyle _timerShadowStyle;
 
         private bool _devConsoleUnsubscribed;
 
@@ -107,6 +155,7 @@ namespace RedAllianceSpeedrun
         {
             Instance = this;
             Logger = base.Logger;
+            ConfigRef = Config;
 
             _restartKey = Config.Bind(
                 "Hotkeys", "RestartKey", KeyCode.Tab,
@@ -354,13 +403,156 @@ namespace RedAllianceSpeedrun
                 }
             }
 
-            Logger.LogInfo($"Restart key: {_restartKey.Value}; Diag key: {_diagKey.Value}; LeakFix: {_leakFixEnabled.Value}");
+            // --- Speedrun tools (ported from v1.4 plugin) ---
+            _fpsToggleKey = Config.Bind(
+                "Hotkeys", "ToggleFPSKey", KeyCode.Q,
+                "Hotkey to swap Application.targetFrameRate between StandartFPS and MinFPS. " +
+                "Low FPS (long Time.deltaTime) is used for certain frame-timing tricks.");
+            _menuToggleKey = Config.Bind(
+                "Hotkeys", "ToggleMenuKey", KeyCode.F10,
+                "Toggle the in-game speedrun menu (level launcher, config editor).");
+
+            _fpsLockEnabled = Config.Bind(
+                "FPS", "FPSLockEnabled", true,
+                "Enforce Application.targetFrameRate (StandartFPS / MinFPS via toggle key) every " +
+                "frame, with vsync forced off. Set false to leave frame pacing entirely to the game.");
+            _standartFPS = Config.Bind(
+                "FPS", "StandartFPS", 100,
+                "Target FPS for normal gameplay. Set to -1 to uncap.");
+            _minFPS = Config.Bind(
+                "FPS", "MinFPS", 5,
+                "Target FPS when toggled low (Q by default). Intentionally low to produce big " +
+                "frame deltas — useful for tricks that need a lag-spike-like timing.");
+
+            _restartLevel = Config.Bind(
+                "Restart", "RestartLevel", "",
+                "Scene name to load when RestartKey is pressed. Leave EMPTY to reload the " +
+                "currently active scene. Example: 'mountains_1', 'prison_1', 'prologue_1'.");
+            _restartSetDifficulty = Config.Bind(
+                "Restart", "RestartSetDifficulty", true,
+                "On TAB restart, force NetworkManager.gameDifficulty to RestartDifficultyValue. " +
+                "Game auto-resets to Normal (1) on relog; this overrides back to your run value.");
+            _restartDifficultyValue = Config.Bind(
+                "Restart", "RestartDifficultyValue", 0,
+                "Difficulty level set on restart. 0=Easy, 1=Normal, 2=Hard, 3=Hardcore.");
+            _practiceMode = Config.Bind(
+                "Restart", "PracticeMode", false,
+                "When true, PlayerStatsSp.CheatsEnabled (desu command) is allowed to stay " +
+                "on for training. When false (default), CheatsEnabled is forced to false " +
+                "on TAB restart and every SceneLoaded — runs guaranteed cheat-free. The " +
+                "cheats_enabled flag is recorded in the end-of-run dump regardless.");
+            PracticeMode = _practiceMode.Value;
+
+            _livesplitEnabled = Config.Bind(
+                "LiveSplit", "Enabled", false,
+                "Send timer commands to LiveSplit via its Server component (TCP). " +
+                "Install LiveSplit.Server.dll in LiveSplit, add the 'LiveSplit Server' " +
+                "component to your layout, right-click → Start Server before launching.");
+            LiveSplitEnabled = _livesplitEnabled.Value;
+            _livesplitHost = Config.Bind(
+                "LiveSplit", "Host", "127.0.0.1",
+                "LiveSplit Server host (default localhost).");
+            LiveSplitHost = _livesplitHost.Value;
+            _livesplitPort = Config.Bind(
+                "LiveSplit", "Port", 16834,
+                "LiveSplit Server TCP port (default 16834).");
+            LiveSplitPort = _livesplitPort.Value;
+            _livesplitSyncRate = Config.Bind(
+                "LiveSplit", "SyncRateHz", 10f,
+                "How many times per second we push IGT via setgametime. 10 = every 100ms.");
+            LiveSplitSyncRate = _livesplitSyncRate.Value;
+            _livesplitSplitOnLevelChange = Config.Bind(
+                "LiveSplit", "SplitOnLevelChange", true,
+                "Split on every scene load while a run is active. Skips the start scene " +
+                "(no split before timer starts) and RunEndScene (handled by the end-of-run " +
+                "block). Overrides AutoSplitScenes when on.");
+            _livesplitSplitScenes = Config.Bind(
+                "LiveSplit", "AutoSplitScenes", "",
+                "Comma-separated scene names that trigger split() on load. Used only when " +
+                "SplitOnLevelChange = false. Example: prison_2,mountains_1. Each scene " +
+                "splits at most once per run.");
+            UpdateLivesplitSplitScenes();
+
+            _showTimers = Config.Bind(
+                "Timers", "ShowTimers", true,
+                "Draw the RTA and IGT timers on screen.");
+            _skipPrison1 = Config.Bind(
+                "Timers", "SkipPrison1", false,
+                "If true, both timers start at 38.470 instead of 0 (compensates for the " +
+                "prison_1 skip).");
+            _timerScreenX = Config.Bind(
+                "Timers", "ScreenX", 16,
+                "Pixels from the left edge of the screen.");
+            _timerScreenY = Config.Bind(
+                "Timers", "ScreenY", 16,
+                "Pixels from the top edge of the screen.");
+            _timerFontSize = Config.Bind(
+                "Timers", "FontSize", 22,
+                "Font size of the timer labels.");
+            _runEndScene = Config.Bind(
+                "Timers", "RunEndScene", "credits",
+                "Scene name that ends the run. Both timers stop when this scene loads.");
+
+            try
+            {
+                var harmony = new Harmony(GUID + ".racfg");
+                harmony.PatchAll(typeof(ConsoleConfigCommandPatch));
+                Logger.LogInfo("[racfg] Console command installed (type 'racfg help' in dev console).");
+            }
+            catch (Exception e)
+            {
+                Logger.LogError("[racfg] Failed to patch: " + e);
+            }
+
+            ApplyFpsCap();
+
+            Logger.LogInfo($"Restart key: {_restartKey.Value}; Diag key: {_diagKey.Value}; Menu key: {_menuToggleKey.Value}; LeakFix: {_leakFixEnabled.Value}");
+        }
+
+        // Copies ConfigEntry.Value into the internal static fields. Called by Awake (after
+        // all Config.Bind calls) and by RaMenu / the racfg console command after a runtime
+        // edit so code that reads the statics sees new values without a restart.
+        internal void SyncStatics()
+        {
+            PracticeMode = _practiceMode.Value;
+            LiveSplitEnabled = _livesplitEnabled.Value;
+            LiveSplitHost = _livesplitHost.Value;
+            LiveSplitPort = _livesplitPort.Value;
+            LiveSplitSyncRate = _livesplitSyncRate.Value;
+            UpdateLivesplitSplitScenes();
+        }
+
+        private void UpdateLivesplitSplitScenes()
+        {
+            string raw = _livesplitSplitScenes?.Value ?? "";
+            if (string.IsNullOrEmpty(raw)) { _livesplitSplitSceneList = new string[0]; return; }
+            var parts = raw.Split(',');
+            for (int i = 0; i < parts.Length; i++) parts[i] = parts[i].Trim();
+            _livesplitSplitSceneList = parts;
+        }
+
+        // Forces PlayerStatsSp.CheatsEnabled = false unless PracticeMode is on. Called
+        // from TryQuickRestart (run start) and OnSceneLoaded (every scene transition) so
+        // cheats can't sneak back via game's own load/state-restore paths.
+        private void ApplyCheatGate()
+        {
+            if (_practiceMode == null || _practiceMode.Value) return;
+            try
+            {
+                if (PlayerStatsSp.CheatsEnabled)
+                {
+                    PlayerStatsSp.CheatsEnabled = false;
+                    Logger.LogInfo("[cheatgate] CheatsEnabled forced to false (PracticeMode=off)");
+                }
+            }
+            catch (Exception e) { Logger.LogWarning("CheatGate failed: " + e.Message); }
         }
 
         private void OnDestroy()
         {
             SceneManager.sceneLoaded -= OnSceneLoaded;
             Application.logMessageReceived -= OnLogCount;
+            LiveSplitClient.Disconnect();
         }
 
         private void OnLogCount(string _, string __, LogType ___)
@@ -419,6 +611,133 @@ namespace RedAllianceSpeedrun
             {
                 StartCoroutine(DisableGuiLayoutAfterLoad());
             }
+
+            ApplyCheatGate();
+
+            // Timer start: only when our designated start scene actually finishes loading
+            // (after click-to-continue). Triggered exactly once per restart. _runIsActive
+            // becomes true here, so the auto-split block below sees it during scene
+            // transitions, but _livesplitLastSplitScene = scene.name prevents splitting
+            // the start scene itself.
+            if (_waitingForLoadComplete && !string.IsNullOrEmpty(_pendingStartScene)
+                && scene.name == _pendingStartScene)
+            {
+                double initial = _skipPrison1.Value ? 38.470 : 0.0;
+                _rta.Reset(initial);
+                _igt.Reset(initial);
+                _rta.Start();
+                _igt.Start();
+                _runIsActive = true;
+                _waitingForLoadComplete = false;
+                _livesplitLastSplitScene = scene.name; // suppress split on the start scene
+                _pendingStartScene = null;
+                Logger.LogInfo($"[timer] run started on scene '{scene.name}' (initial offset {initial:F3}s)");
+                LiveSplitClient.StartTimer();
+                _livesplitNextSyncTime = 0f;
+            }
+
+            // Auto-split logic. SplitOnLevelChange fires once per distinct scene change
+            // during an active run, skipping the run-end scene (handled below). When that
+            // flag is off, fall back to the AutoSplitScenes whitelist.
+            if (_runIsActive && scene.name != _runEndScene.Value)
+            {
+                bool shouldSplit = false;
+                if (_livesplitSplitOnLevelChange != null && _livesplitSplitOnLevelChange.Value)
+                {
+                    if (_livesplitLastSplitScene != scene.name) shouldSplit = true;
+                }
+                else if (_livesplitSplitSceneList != null && _livesplitSplitSceneList.Length > 0)
+                {
+                    foreach (var trigger in _livesplitSplitSceneList)
+                    {
+                        if (string.IsNullOrEmpty(trigger)) continue;
+                        if (scene.name == trigger && _livesplitLastSplitScene != trigger)
+                        {
+                            shouldSplit = true;
+                            break;
+                        }
+                    }
+                }
+                if (shouldSplit)
+                {
+                    _livesplitLastSplitScene = scene.name;
+                    LiveSplitClient.Split();
+                    Logger.LogInfo($"[livesplit] split on scene '{scene.name}'");
+                }
+            }
+
+            // End-of-run: stop both timers when the run-end scene (credits) loads.
+            if (scene.name == _runEndScene.Value && _runIsActive)
+            {
+                _rta.Stop();
+                _igt.Stop();
+                _runIsActive = false;
+                Logger.LogInfo($"[timer] run ended on scene '{scene.name}'. RTA={_rta.Format()} IGT={_igt.Format()}");
+                LiveSplitClient.SetGameTime(_igt.Elapsed); // final IGT push
+                LiveSplitClient.Split();
+                DumpRunConfigForModeration();
+            }
+        }
+
+        // End-of-run audit dump. Lists every ConfigEntry value plus a content hash for
+        // moderators to verify a speedrun submission against. Spans multiple log lines
+        // bracketed by markers so it's easy to extract from BepInEx/LogOutput.log.
+        private void DumpRunConfigForModeration()
+        {
+            try
+            {
+                var lines = new List<string>();
+                if (ConfigRef != null)
+                {
+                    foreach (var def in ConfigRef.Keys)
+                    {
+                        var entry = ConfigRef[def];
+                        lines.Add($"{def.Section}.{def.Key}={entry.BoxedValue}");
+                    }
+                }
+                lines.Sort(StringComparer.Ordinal);
+
+                ulong hash = 14695981039346656037UL;
+                foreach (var l in lines)
+                {
+                    foreach (var ch in l) { hash ^= ch; hash *= 1099511628211UL; }
+                    hash ^= (byte)'\n'; hash *= 1099511628211UL;
+                }
+                string hashStr = $"fnv1a64:{hash:X16}";
+
+                bool cheats = false;
+                try { cheats = PlayerStatsSp.CheatsEnabled; } catch { }
+
+                string[] header = new[]
+                {
+                    "===== [RACFG-DUMP-BEGIN] =====",
+                    $"plugin_version=0.19.0",
+                    $"game_version=1.3",
+                    $"rta={_rta.Format()}",
+                    $"igt={_igt.Format()}",
+                    $"end_scene={SceneManager.GetActiveScene().name}",
+                    $"timestamp_utc={DateTime.UtcNow:o}",
+                    $"cheats_enabled={cheats}",
+                    $"config_hash={hashStr}",
+                    $"config_entries={lines.Count}",
+                };
+
+                foreach (var h in header) Emit(h);
+                foreach (var l in lines) Emit("  " + l);
+                Emit("===== [RACFG-DUMP-END] =====");
+            }
+            catch (Exception e)
+            {
+                Logger.LogError("[racfg] dump failed: " + e);
+            }
+        }
+
+        // Emit a line both to BepInEx log and the in-game developer console (if available).
+        private static void Emit(string line)
+        {
+            Logger.LogMessage(line);
+            try { DeveloperConsoleScript.AddConsoleMessage(line); }
+            catch { /* console may not be initialized */ }
         }
 
         // Turn off the IMGUI Layout pass on OnGUI scripts that only use direct GUI.* calls.
@@ -934,10 +1253,42 @@ namespace RedAllianceSpeedrun
                 _logCountThisWindow = 0;
             }
 
+            // Periodic IGT push to LiveSplit Server.
+            if (LiveSplitEnabled && _runIsActive && LiveSplitSyncRate > 0f)
+            {
+                if (Time.unscaledTime >= _livesplitNextSyncTime)
+                {
+                    LiveSplitClient.SetGameTime(_igt.Elapsed);
+                    _livesplitNextSyncTime = Time.unscaledTime + (1f / LiveSplitSyncRate);
+                }
+            }
+
+            // Tick both timers with this frame's real elapsed time.
+            {
+                double dt = Time.unscaledDeltaTime;
+                bool isLoading = SceneManagerScript.LoadingLevel;
+                bool isPaused = false;
+                try { isPaused = PauseMenuScript.paused; } catch { }
+                _rta.Tick(dt, isLoading, isPaused);
+                _igt.Tick(dt, isLoading, isPaused);
+            }
+
             if (Input.GetKeyDown(_restartKey.Value))
             {
                 TryQuickRestart();
             }
+            if (Input.GetKeyDown(_fpsToggleKey.Value))
+            {
+                ToggleFpsCap();
+            }
+            if (Input.GetKeyDown(_menuToggleKey.Value))
+            {
+                RaMenu.Toggle();
+            }
+
+            // Enforce target FPS every frame — game settings menus, vsync changes, etc. may
+            // overwrite it otherwise. Cheap to set.
+            ApplyFpsCap();
             if (Input.GetKeyDown(_diagKey.Value))
             {
                 LogDiagnostics("manual");
@@ -982,14 +1333,103 @@ namespace RedAllianceSpeedrun
                 return;
             }
 
-            var loadType = (active == "main_menu" || active == "credits")
+            // Target scene: configured RestartLevel if non-empty, else current scene.
+            string target = (_restartLevel.Value != null && _restartLevel.Value.Length > 0)
+                ? _restartLevel.Value
+                : active;
+
+            var loadType = (target == "main_menu" || target == "credits")
                 ? LevelLoadingType.Reset
                 : LevelLoadingType.Transfer;
 
-            Logger.LogInfo($"Quick restart -> '{active}' (loadType={loadType}).");
+            Logger.LogInfo($"Quick restart -> '{target}' (from '{active}', loadType={loadType}).");
             try { NetworkManager.OnStartedNewGame(); }
             catch (Exception e) { Logger.LogWarning("OnStartedNewGame threw: " + e.Message); }
-            smgr.StartCoroutine(smgr.LoadLevel(active, 0f, false, Vector3.zero, Vector3.zero, loadType));
+
+            if (_restartSetDifficulty.Value)
+            {
+                try
+                {
+                    int diffInt = Mathf.Clamp(_restartDifficultyValue.Value, 0, 3);
+                    NetworkManager.gameDifficulty = (GameDifficulty)diffInt;
+                    var wc = WorldComponents.Instance;
+                    if ((bool)wc && (object)wc.GameSettingsScript != null)
+                        wc.GameSettingsScript.UpdateDifficultyLabel();
+                    Logger.LogInfo($"[restart] gameDifficulty = {(GameDifficulty)diffInt} ({diffInt})");
+                }
+                catch (Exception e) { Logger.LogWarning("Set difficulty failed: " + e.Message); }
+            }
+
+            ApplyCheatGate();
+            PrepareTimersForLaunch(target);
+
+            smgr.StartCoroutine(smgr.LoadLevel(target, 0f, false, Vector3.zero, Vector3.zero, loadType));
+        }
+
+        // Reset and prime the timers — they start in OnSceneLoaded once the target scene
+        // finishes loading. Also called by RaMenu before launching a level so menu launches
+        // behave exactly like a TAB restart.
+        internal void PrepareTimersForLaunch(string sceneName)
+        {
+            double initial = _skipPrison1.Value ? 38.470 : 0.0;
+            _rta.Reset(initial);
+            _igt.Reset(initial);
+            _waitingForLoadComplete = true;
+            _runIsActive = false;
+            _livesplitLastSplitScene = null;
+            _pendingStartScene = sceneName;
+            LiveSplitClient.Reset();
+        }
+
+        private void ToggleFpsCap()
+        {
+            if (!_fpsLockEnabled.Value) { Logger.LogMessage("[fps] FPSLockEnabled=false, toggle ignored"); return; }
+            _fpsLow = !_fpsLow;
+            ApplyFpsCap();
+            Logger.LogMessage($"[fps] cap = {(_fpsLow ? _minFPS.Value : _standartFPS.Value)} ({(_fpsLow ? "LOW" : "STANDART")})");
+        }
+
+        private void ApplyFpsCap()
+        {
+            if (_fpsLockEnabled == null || !_fpsLockEnabled.Value) return;
+            int target = _fpsLow ? _minFPS.Value : _standartFPS.Value;
+            // targetFrameRate is ignored while vSyncCount > 0, so force vsync off.
+            QualitySettings.vSyncCount = 0;
+            Application.targetFrameRate = target;
+        }
+
+        private void EnsureGuiStyle()
+        {
+            if (_timerStyle != null) return;
+            _timerStyle = new GUIStyle(GUI.skin.label);
+            _timerStyle.fontSize = _timerFontSize.Value;
+            _timerStyle.fontStyle = FontStyle.Bold;
+            _timerStyle.normal.textColor = Color.white;
+            _timerStyle.alignment = TextAnchor.UpperLeft;
+
+            _timerShadowStyle = new GUIStyle(_timerStyle);
+            _timerShadowStyle.normal.textColor = Color.black;
+        }
+
+        private void OnGUI()
+        {
+            if (RaMenu.Visible) RaMenu.Draw(0x5E5E0042);
+            if (_showTimers == null || !_showTimers.Value) return;
+            EnsureGuiStyle();
+
+            int x = _timerScreenX.Value;
+            int y = _timerScreenY.Value;
+            int rowH = _timerFontSize.Value + 4;
+
+            string rtaText = $"RTA  {_rta.Format()}";
+            string igtText = $"IGT  {_igt.Format()}";
+
+            // Drop shadow for readability over varied backgrounds.
+            GUI.Label(new Rect(x + 1, y + 1, 400, rowH), rtaText, _timerShadowStyle);
+            GUI.Label(new Rect(x, y, 400, rowH), rtaText, _timerStyle);
+
+            GUI.Label(new Rect(x + 1, y + rowH + 1, 400, rowH), igtText, _timerShadowStyle);
+            GUI.Label(new Rect(x, y + rowH, 400, rowH), igtText, _timerStyle);
         }
 
         internal void LogDiagnostics(string tag)
