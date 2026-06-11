@@ -1,7 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net46</TargetFramework>
+    <!-- net35, NOT net46: the game runs Unity 2017.4 on the legacy .NET 3.5 Mono profile.
+         Against net46 reference assemblies Roslyn emits Array.Empty<T>() for empty params
+         arguments (every GUILayout call), which throws MissingMethodException in game. -->
+    <TargetFramework>net35</TargetFramework>
     <AssemblyName>RedAllianceSpeedrun</AssemblyName>
     <RootNamespace>RedAllianceSpeedrun</RootNamespace>
     <LangVersion>latest</LangVersion>
