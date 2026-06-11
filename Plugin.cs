@@ -28,6 +28,7 @@ namespace RedAllianceSpeedrun
         internal static string LiveSplitHost;
         internal static int LiveSplitPort;
         internal static float LiveSplitSyncRate;
+        internal static bool SkipPrison1Redirect;
 
         private ConfigEntry<KeyCode> _restartKey;
         private ConfigEntry<KeyCode> _diagKey;
@@ -51,6 +52,8 @@ namespace RedAllianceSpeedrun
         private ConfigEntry<string> _restartLevel;
         private ConfigEntry<bool> _restartSetDifficulty;
         private ConfigEntry<int> _restartDifficultyValue;
+        private ConfigEntry<bool> _skipPrison1Level;
+        private ConfigEntry<bool> _deleteSavesOnRestart;
         private ConfigEntry<bool> _practiceMode;
         private ConfigEntry<bool> _livesplitEnabled;
         private ConfigEntry<string> _livesplitHost;
@@ -71,6 +74,7 @@ namespace RedAllianceSpeedrun
         private bool _waitingForLoadComplete; // after TAB, start timers when load completes
         private bool _runIsActive;            // true between run start and RunEndScene load
         private string _pendingStartScene;    // timer starts when this scene finishes loading
+        private int _lastSplitBuildIndex = -1; // splits only fire for scenes with a HIGHER build index
         private float _livesplitNextSyncTime;
         private string[] _livesplitSplitSceneList;
         private string _livesplitLastSplitScene;
@@ -271,6 +275,19 @@ namespace RedAllianceSpeedrun
             _restartDifficultyValue = Config.Bind(
                 "Restart", "RestartDifficultyValue", 0,
                 "Difficulty level set on restart. 0=Easy, 1=Normal, 2=Hard, 3=Hardcore.");
+            _skipPrison1Level = Config.Bind(
+                "Restart", "SkipPrison1Level", true,
+                "Redirect every load of 'prison_1' (a ~38s cutscene level) to 'prison_2'. " +
+                "Keeps run timing simple: the speedrun route loads prison_2 directly. " +
+                "Pair with Timers.SkipPrison1 if your category counts the cutscene time.");
+            SkipPrison1Redirect = _skipPrison1Level.Value;
+            _deleteSavesOnRestart = Config.Bind(
+                "Restart", "DeleteSavesOnRestart", true,
+                "Delete all save slots (Assets/SaveData/red-alliance-*.cfg) on every TAB " +
+                "restart / menu level launch. Prevents loading a save to jump levels ahead " +
+                "mid-run, which would corrupt splits and run integrity. gameData.cfg " +
+                "(settings/achievements) is never touched. WARNING: wipes normal-play saves " +
+                "too — set false if you alternate speedruns with a casual playthrough.");
             _practiceMode = Config.Bind(
                 "Restart", "PracticeMode", false,
                 "When true, PlayerStatsSp.CheatsEnabled (desu command) is allowed to stay " +
@@ -340,6 +357,21 @@ namespace RedAllianceSpeedrun
                 Logger.LogError("[racfg] Failed to patch: " + e);
             }
 
+            try
+            {
+                var harmony = new Harmony(GUID + ".sceneflow");
+                harmony.PatchAll(typeof(LoadLevelDuplicateGuardPatch));
+                harmony.PatchAll(typeof(SkipPrison1Patch));
+                harmony.PatchAll(typeof(SkipPrison1RpcPatch));
+                harmony.PatchAll(typeof(SkipPrison1AsyncPatch));
+                harmony.PatchAll(typeof(SaveLoadDetectPatch));
+                Logger.LogInfo("[sceneflow] Patched: duplicate-load guard (black screen fix), prison_1 skip, save-load split detector.");
+            }
+            catch (Exception e)
+            {
+                Logger.LogError("[sceneflow] Failed to patch: " + e);
+            }
+
             ApplyFpsCap();
 
             Logger.LogInfo($"Restart key: {_restartKey.Value}; Diag key: {_diagKey.Value}; Menu key: {_menuToggleKey.Value}");
@@ -351,6 +383,7 @@ namespace RedAllianceSpeedrun
         internal void SyncStatics()
         {
             PracticeMode = _practiceMode.Value;
+            SkipPrison1Redirect = _skipPrison1Level.Value;
             LiveSplitEnabled = _livesplitEnabled.Value;
             LiveSplitHost = _livesplitHost.Value;
             LiveSplitPort = _livesplitPort.Value;
@@ -401,6 +434,9 @@ namespace RedAllianceSpeedrun
         {
             if (mode != LoadSceneMode.Single) return;
 
+            // A load finished — re-arm the duplicate-load guard for the next one.
+            LoadLevelDuplicateGuardPatch.Clear();
+
             // Reset spike-log timing baseline. Increment restart counter for any non-startup scene.
             _lastSceneLoadTime = Time.unscaledTime;
             _frameInWindow = 0;
@@ -447,6 +483,7 @@ namespace RedAllianceSpeedrun
                 _runIsActive = true;
                 _waitingForLoadComplete = false;
                 _livesplitLastSplitScene = scene.name; // suppress split on the start scene
+                _lastSplitBuildIndex = scene.buildIndex; // splits only fire for higher level IDs
                 _pendingStartScene = null;
                 Logger.LogInfo($"[timer] run started on scene '{scene.name}' (initial offset {initial:F3}s)");
                 LiveSplitClient.StartTimer();
@@ -475,13 +512,38 @@ namespace RedAllianceSpeedrun
                         }
                     }
                 }
+
+                // Level-ID guard: split only when the level ID (scene build index — the game
+                // orders levels by progression) strictly INCREASES. Replays, backtracks and
+                // restarts of already-split levels never split twice.
+                if (shouldSplit && scene.buildIndex <= _lastSplitBuildIndex)
+                {
+                    shouldSplit = false;
+                    Logger.LogInfo($"[splitguard] no split: '{scene.name}' id={scene.buildIndex} <= last split id={_lastSplitBuildIndex}");
+                }
+
+                // Save-load guard: a scene change caused by loading a save is not run
+                // progress — no split, even if it's the next level. The level-ID watermark
+                // still advances so the jumped-over levels can't split later either.
+                bool saveLoad = SaveLoadDetectPatch.IsActive();
+                try { saveLoad |= GameSaveScript.Loading; } catch { }
+                if (shouldSplit && saveLoad)
+                {
+                    shouldSplit = false;
+                    _livesplitLastSplitScene = scene.name;
+                    if (scene.buildIndex > _lastSplitBuildIndex) _lastSplitBuildIndex = scene.buildIndex;
+                    Logger.LogInfo($"[splitguard] no split: '{scene.name}' was reached by loading a save.");
+                }
+
                 if (shouldSplit)
                 {
                     _livesplitLastSplitScene = scene.name;
+                    _lastSplitBuildIndex = scene.buildIndex;
                     LiveSplitClient.Split();
-                    Logger.LogInfo($"[livesplit] split on scene '{scene.name}'");
+                    Logger.LogInfo($"[livesplit] split on scene '{scene.name}' (id={scene.buildIndex})");
                 }
             }
+            SaveLoadDetectPatch.Clear();
 
             // End-of-run: stop both timers when the run-end scene (credits) loads.
             if (scene.name == _runEndScene.Value && _runIsActive)
@@ -1033,8 +1095,38 @@ namespace RedAllianceSpeedrun
             _waitingForLoadComplete = true;
             _runIsActive = false;
             _livesplitLastSplitScene = null;
+            _lastSplitBuildIndex = -1;
             _pendingStartScene = sceneName;
             LiveSplitClient.Reset();
+            if (_deleteSavesOnRestart != null && _deleteSavesOnRestart.Value)
+            {
+                DeleteSaveSlots();
+            }
+        }
+
+        // Deletes the 10 save-slot files so a mid-run save load (level jump) is impossible.
+        // Only red-alliance-*.cfg slots — gameData.cfg (settings, achievements, counters)
+        // lives in Assets/Resources and is never touched.
+        private void DeleteSaveSlots()
+        {
+            try
+            {
+                string dir = System.IO.Path.GetFullPath("Assets\\SaveData");
+                if (!System.IO.Directory.Exists(dir)) return;
+                int deleted = 0;
+                string[] files = System.IO.Directory.GetFiles(dir, "red-alliance-*.cfg");
+                for (int i = 0; i < files.Length; i++)
+                {
+                    try { System.IO.File.Delete(files[i]); deleted++; }
+                    catch (Exception e) { Logger.LogWarning($"[savewipe] couldn't delete '{files[i]}': {e.Message}"); }
+                }
+                if (deleted > 0)
+                    Logger.LogInfo($"[savewipe] deleted {deleted} save slot(s) on restart (DeleteSavesOnRestart=true).");
+            }
+            catch (Exception e)
+            {
+                Logger.LogError("[savewipe] failed: " + e);
+            }
         }
 
         private void ToggleFpsCap()
