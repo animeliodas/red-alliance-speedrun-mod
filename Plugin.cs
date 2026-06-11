@@ -8,7 +8,7 @@ using UnityEngine.SceneManagement;
 
 namespace RedAllianceSpeedrun
 {
-    [BepInPlugin(GUID, "Red Alliance Speedrun Tools", "1.0.0")]
+    [BepInPlugin(GUID, "Red Alliance Speedrun Mod", "2.0.0")]
     public class Plugin : BaseUnityPlugin
     {
         public const string GUID = "redalliance.speedrun.v2";
@@ -559,7 +559,7 @@ namespace RedAllianceSpeedrun
                 string[] header = new[]
                 {
                     "===== [RACFG-DUMP-BEGIN] =====",
-                    $"plugin_version=1.0.0",
+                    $"plugin_version=2.0.0",
                     $"rta={_rta.Format()}",
                     $"igt={_igt.Format()}",
                     $"end_scene={SceneManager.GetActiveScene().name}",
