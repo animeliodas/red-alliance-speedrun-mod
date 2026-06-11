@@ -1067,9 +1067,32 @@ namespace RedAllianceSpeedrun
             _timerShadowStyle.normal.textColor = Color.black;
         }
 
+        private float _lastMenuErrorTime;
+
         private void OnGUI()
         {
-            if (RaMenu.Visible) RaMenu.Draw(0x5E5E0042);
+            // Timers first: a menu-drawing exception must never take the timers down with it.
+            DrawTimers();
+
+            if (RaMenu.Visible)
+            {
+                try
+                {
+                    RaMenu.Draw(0x5E5E0042);
+                }
+                catch (Exception e)
+                {
+                    if (Time.unscaledTime - _lastMenuErrorTime > 5f)
+                    {
+                        _lastMenuErrorTime = Time.unscaledTime;
+                        Logger.LogError("[menu] draw failed: " + e);
+                    }
+                }
+            }
+        }
+
+        private void DrawTimers()
+        {
             if (_showTimers == null || !_showTimers.Value) return;
             EnsureGuiStyle();
 

@@ -40,11 +40,17 @@ namespace RedAllianceSpeedrun
         public static void Draw(int windowId)
         {
             EnsureStyles();
-            // GUILayout.Window, not GUI.Window: the window body uses GUILayout.* calls, and
-            // on Unity 2017.4 the layout system inside a window callback only runs when the
-            // window itself was created through GUILayout (GUI.Window renders an empty box).
-            _windowRect = GUILayout.Window(windowId, _windowRect, DrawWindow,
-                "Red Alliance Speedrun — Menu");
+            // No GUI.Window/GUILayout.Window: their deferred window callbacks proved
+            // unreliable on this Unity 2017.4 build (GUI.Window rendered an empty frame,
+            // GUILayout.Window nothing at all). A plain BeginArea with a box background
+            // draws in the immediate OnGUI pass and just works. Fixed position, no drag.
+            GUI.Box(_windowRect, GUIContent.none);
+            GUILayout.BeginArea(_windowRect);
+            GUILayout.BeginVertical(GUI.skin.box);
+            GUILayout.Label("Red Alliance Speedrun — Menu", _hdrStyle);
+            DrawWindow(windowId);
+            GUILayout.EndVertical();
+            GUILayout.EndArea();
         }
 
         private static void EnsureStyles()
@@ -68,7 +74,6 @@ namespace RedAllianceSpeedrun
             DrawConfigSection();
 
             GUILayout.EndVertical();
-            GUI.DragWindow(new Rect(0, 0, _windowRect.width, 20));
         }
 
         private static void DrawModeSection()
