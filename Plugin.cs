@@ -305,9 +305,11 @@ namespace RedAllianceSpeedrun
                 "Optimizations", "DisableGUILayoutPass", true,
                 "Legacy IMGUI calls every OnGUI twice per frame (Layout + Repaint) and allocates " +
                 "an Event object per pass (~1KB/call measured on PlayerGraphScript alone). " +
-                "PlayerGraphScript, CrosshairScript, FadeScript and SceneManagerScript only use " +
-                "direct GUI.* calls with explicit Rects - the Layout pass is pure waste for them. " +
-                "Set useGUILayout=false on those components after each scene load. " +
+                "PlayerGraphScript and CrosshairScript only use direct GUI.* calls with explicit " +
+                "Rects - the Layout pass is pure waste for them. Set useGUILayout=false on those " +
+                "components after each scene load. FadeScript and SceneManagerScript are excluded: " +
+                "disabling their Layout pass stopped the loading-screen progress bar and the " +
+                "'press any key' prompt from rendering, and their OnGUI cost is negligible. " +
                 "DeveloperConsoleScript uses GUILayout and is left untouched.");
 
             var alertInterval = Config.Bind(
@@ -432,10 +434,14 @@ namespace RedAllianceSpeedrun
                 if ((bool)graph && graph.useGUILayout) { graph.useGUILayout = false; n++; }
                 var cross = FindObjectOfType<CrosshairScript>();
                 if ((bool)cross && cross.useGUILayout) { cross.useGUILayout = false; n++; }
+                // FadeScript / SceneManagerScript intentionally excluded: with useGUILayout=false
+                // their loading-screen overlay (progress bar, "press any key") stopped rendering.
+                // Both are DontDestroyOnLoad singletons, so also undo the flag if a previous
+                // plugin version already cleared it on them.
                 var fade = FindObjectOfType<FadeScript>();
-                if ((bool)fade && fade.useGUILayout) { fade.useGUILayout = false; n++; }
+                if ((bool)fade && !fade.useGUILayout) { fade.useGUILayout = true; }
                 var smgr = SceneManagerScript.Instance;
-                if ((bool)smgr && smgr.useGUILayout) { smgr.useGUILayout = false; n++; }
+                if ((bool)smgr && !smgr.useGUILayout) { smgr.useGUILayout = true; }
             }
             catch (Exception e)
             {
