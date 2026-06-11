@@ -40,7 +40,10 @@ namespace RedAllianceSpeedrun
         public static void Draw(int windowId)
         {
             EnsureStyles();
-            _windowRect = GUI.Window(windowId, _windowRect, DrawWindow,
+            // GUILayout.Window, not GUI.Window: the window body uses GUILayout.* calls, and
+            // on Unity 2017.4 the layout system inside a window callback only runs when the
+            // window itself was created through GUILayout (GUI.Window renders an empty box).
+            _windowRect = GUILayout.Window(windowId, _windowRect, DrawWindow,
                 "Red Alliance Speedrun — Menu");
         }
 
