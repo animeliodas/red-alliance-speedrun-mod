@@ -44,9 +44,12 @@ namespace RedAllianceSpeedrun
             // unreliable on this Unity 2017.4 build (GUI.Window rendered an empty frame,
             // GUILayout.Window nothing at all). A plain BeginArea with a box background
             // draws in the immediate OnGUI pass and just works. Fixed position, no drag.
+            // Height tracks the screen so the config section gets all remaining space.
+            _windowRect = new Rect(80, 40, 560, Mathf.Max(400, Screen.height - 80));
             GUI.Box(_windowRect, GUIContent.none);
             GUILayout.BeginArea(_windowRect);
-            GUILayout.BeginVertical(GUI.skin.box);
+            GUILayout.BeginVertical(GUI.skin.box, GUILayout.ExpandHeight(true),
+                GUILayout.Height(_windowRect.height));
             GUILayout.Label("Red Alliance Speedrun — Menu", _hdrStyle);
             DrawWindow(windowId);
             GUILayout.EndVertical();
@@ -215,7 +218,9 @@ namespace RedAllianceSpeedrun
                 Plugin.ConfigRef?.Save();
             GUILayout.EndHorizontal();
 
-            _scroll = GUILayout.BeginScrollView(_scroll, GUILayout.MinHeight(280));
+            // ExpandHeight: take all space left below the Mode and Level sections, so long
+            // config lists scroll inside the menu instead of being clipped by its bottom edge.
+            _scroll = GUILayout.BeginScrollView(_scroll, GUILayout.ExpandHeight(true));
             if (Plugin.ConfigRef != null)
             {
                 string section = null;

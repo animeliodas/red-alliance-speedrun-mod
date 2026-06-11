@@ -110,10 +110,18 @@ namespace RedAllianceSpeedrun
         }
     }
 
-    // Marks the next scene load as "caused by loading a save", so the autosplitter can
-    // suppress the split: jumping levels via a save is not run progress. GameSaveScript.Loading
-    // covers most of the load window too, but the flag survives ordering differences between
-    // the Loading property and the sceneLoaded callback.
+    // Two jobs on GameSaveScript.LoadGameRemote:
+    //
+    // 1) Empty-slot guard. The original method destroys the player canvas and the player
+    //    object IMMEDIATELY, then starts the Load coroutine that reads the slot file. If the
+    //    file is missing (e.g. wiped by DeleteSavesOnRestart) or empty, the load fails after
+    //    the destruction — permanent black screen, same destroy-then-abort pattern as the
+    //    LoadLevel race. Reject the load before anything is destroyed.
+    //
+    // 2) Marks the next scene load as "caused by loading a save", so the autosplitter can
+    //    suppress the split: jumping levels via a save is not run progress.
+    //    GameSaveScript.Loading covers most of the load window too, but the flag survives
+    //    ordering differences between the Loading property and the sceneLoaded callback.
     [HarmonyPatch(typeof(GameSaveScript), nameof(GameSaveScript.LoadGameRemote))]
     internal static class SaveLoadDetectPatch
     {
@@ -122,11 +130,30 @@ namespace RedAllianceSpeedrun
         private const float PendingTimeout = 60f;
 
         [HarmonyPrefix]
-        private static void Prefix()
+        private static bool Prefix(Config cfg)
         {
+            bool valid = false;
+            try
+            {
+                valid = cfg != null
+                    && System.IO.File.Exists(cfg.path)
+                    && new System.IO.FileInfo(cfg.path).Length > 0;
+            }
+            catch { }
+            if (!valid)
+            {
+                Plugin.Logger.LogWarning(
+                    "[saveguard] LoadGameRemote rejected: save slot file is missing or empty. " +
+                    "The original would destroy the player first and hang on a black screen.");
+                try { DeveloperConsoleScript.AddConsoleMessage("Save slot is empty — load cancelled."); }
+                catch { }
+                return false; // skip original — nothing gets destroyed
+            }
+
             Pending = true;
             PendingSince = Time.unscaledTime;
             Plugin.Logger.LogInfo("[splitguard] save load started — next scene change will not split.");
+            return true;
         }
 
         internal static bool IsActive()
