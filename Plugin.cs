@@ -56,6 +56,12 @@ namespace RedAllianceSpeedrun
         private ConfigEntry<int> _restartDifficultyValue;
         private ConfigEntry<bool> _speedrunMode;
         private ConfigEntry<bool> _practiceMode;
+        private ConfigEntry<bool> _livesplitEnabled;
+        private ConfigEntry<string> _livesplitHost;
+        private ConfigEntry<int> _livesplitPort;
+        private ConfigEntry<float> _livesplitSyncRate;
+        private ConfigEntry<string> _livesplitSplitScenes;
+        private ConfigEntry<bool> _livesplitSplitOnLevelChange;
 
         // Timers
         private ConfigEntry<bool> _showTimers;
@@ -84,6 +90,16 @@ namespace RedAllianceSpeedrun
         internal static bool LogClipEvents;
         internal static bool SpeedrunMode;
         internal static bool PracticeMode;
+        internal static bool LiveSplitEnabled;
+        internal static string LiveSplitHost;
+        internal static int LiveSplitPort;
+        internal static float LiveSplitSyncRate;
+        private float _livesplitNextSyncTime;
+        private string[] _livesplitSplitSceneList;
+        private string _livesplitLastSplitScene;
+        private int _lastSplitBuildIndex = -1; // splits only fire for scenes with a HIGHER build index
+        private ConfigEntry<bool> _deleteSavesOnRestart;
+        private string _pendingStartScene; // target scene name; timer starts when SceneManager loads this one
 
         // Timer state
         private readonly SpeedrunTimer _rta = new SpeedrunTimer("RTA", false, false);
@@ -160,6 +176,13 @@ namespace RedAllianceSpeedrun
                 "to prison_2 (skip 38s cutscene). Save UI button + F5 unblocked. Re-applied " +
                 "on every SceneLoaded so disableVortexMode triggers don't undo it.");
             SpeedrunMode = _speedrunMode.Value;
+            _deleteSavesOnRestart = Config.Bind(
+                "Restart", "DeleteSavesOnRestart", true,
+                "Delete all save slots (Assets/SaveData/red-alliance-*.cfg, including the " +
+                "vortex slot) on every TAB restart / menu level launch. Prevents loading a " +
+                "pre-existing save to jump levels ahead mid-run. Saves made DURING the run " +
+                "are unaffected until the next restart. gameData.cfg (settings/achievements) " +
+                "is never touched. Set false if you alternate runs with a casual playthrough.");
             _practiceMode = Config.Bind(
                 "Restart", "PracticeMode", false,
                 "When true, PlayerStatsSp.CheatsEnabled (desu command) is allowed to stay " +
@@ -167,6 +190,35 @@ namespace RedAllianceSpeedrun
                 "on TAB restart and every SceneLoaded — runs guaranteed cheat-free. The " +
                 "cheats_enabled flag is recorded in the end-of-run dump regardless.");
             PracticeMode = _practiceMode.Value;
+            _livesplitEnabled = Config.Bind(
+                "LiveSplit", "Enabled", false,
+                "Send timer commands to LiveSplit via its Server component (TCP). " +
+                "Install LiveSplit.Server.dll in LiveSplit, add the 'LiveSplit Server' " +
+                "component to your layout, right-click → Start Server before launching.");
+            LiveSplitEnabled = _livesplitEnabled.Value;
+            _livesplitHost = Config.Bind(
+                "LiveSplit", "Host", "127.0.0.1",
+                "LiveSplit Server host (default localhost).");
+            LiveSplitHost = _livesplitHost.Value;
+            _livesplitPort = Config.Bind(
+                "LiveSplit", "Port", 16834,
+                "LiveSplit Server TCP port (default 16834).");
+            LiveSplitPort = _livesplitPort.Value;
+            _livesplitSyncRate = Config.Bind(
+                "LiveSplit", "SyncRateHz", 10f,
+                "How many times per second we push IGT via setgametime. 10 = every 100ms.");
+            LiveSplitSyncRate = _livesplitSyncRate.Value;
+            _livesplitSplitOnLevelChange = Config.Bind(
+                "LiveSplit", "SplitOnLevelChange", true,
+                "Split on every scene load while a run is active. Skips the start scene " +
+                "(no split before timer starts) and RunEndScene (handled by the end-of-run " +
+                "block). Overrides AutoSplitScenes when on.");
+            _livesplitSplitScenes = Config.Bind(
+                "LiveSplit", "AutoSplitScenes", "",
+                "Comma-separated scene names that trigger split() on load. Used only when " +
+                "SplitOnLevelChange = false. Example: prison_2,mountains_1. Each scene " +
+                "splits at most once per run.");
+            UpdateLivesplitSplitScenes();
 
             // --- Clip-through ---
             _autoEnableAllowClip = Config.Bind(
@@ -297,7 +349,9 @@ namespace RedAllianceSpeedrun
                 harmony.PatchAll(typeof(SpeedrunBlockAutosaveRemotePatch));
                 harmony.PatchAll(typeof(SpeedrunBlockAutosaveScriptPatch));
                 harmony.PatchAll(typeof(ConsoleConfigCommandPatch));
-                Logger.LogInfo("[clip] Harmony patches installed (CrouchController, SetCrouchingState, CasualController, Accelerate, LoadLevel, PauseMenu.Pause).");
+                harmony.PatchAll(typeof(LoadLevelDuplicateGuardPatch));
+                harmony.PatchAll(typeof(SaveLoadDetectPatch));
+                Logger.LogInfo("[clip] Harmony patches installed (CrouchController, SetCrouchingState, CasualController, Accelerate, LoadLevel, PauseMenu.Pause, load guards).");
             }
             catch (Exception e)
             {
@@ -313,6 +367,7 @@ namespace RedAllianceSpeedrun
         private void OnDestroy()
         {
             SceneManager.sceneLoaded -= OnSceneLoaded;
+            LiveSplitClient.Disconnect();
         }
 
         // Copies ConfigEntry.Value into the internal static fields. Called by Awake (after
@@ -338,6 +393,20 @@ namespace RedAllianceSpeedrun
             LogClipEvents = _logClipEvents.Value;
             SpeedrunMode = _speedrunMode.Value;
             PracticeMode = _practiceMode.Value;
+            LiveSplitEnabled = _livesplitEnabled.Value;
+            LiveSplitHost = _livesplitHost.Value;
+            LiveSplitPort = _livesplitPort.Value;
+            LiveSplitSyncRate = _livesplitSyncRate.Value;
+            UpdateLivesplitSplitScenes();
+        }
+
+        private void UpdateLivesplitSplitScenes()
+        {
+            string raw = _livesplitSplitScenes?.Value ?? "";
+            if (string.IsNullOrEmpty(raw)) { _livesplitSplitSceneList = new string[0]; return; }
+            var parts = raw.Split(',');
+            for (int i = 0; i < parts.Length; i++) parts[i] = parts[i].Trim();
+            _livesplitSplitSceneList = parts;
         }
 
         // Forces PlayerStatsSp.CheatsEnabled = false unless PracticeMode is on. Called
@@ -360,17 +429,100 @@ namespace RedAllianceSpeedrun
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
             if (mode != LoadSceneMode.Single) return;
+
+            // A load finished — re-arm the duplicate-load guard for the next one.
+            LoadLevelDuplicateGuardPatch.Clear();
+
             ApplyAllowClipIfEnabled();
             ApplySpeedrunModeIfEnabled();
             ApplyCheatGate();
 
+            // Timer start: only when our designated start scene actually finishes loading
+            // (after click-to-continue, after asyncLoadingOperation.allowSceneActivation =
+            // true). Triggered exactly once per restart. _runIsActive becomes true here,
+            // so the auto-split block below sees it during scene transitions, but we mark
+            // _livesplitLastSplitScene = scene.name to prevent splitting the start scene.
+            if (_waitingForLoadComplete && !string.IsNullOrEmpty(_pendingStartScene)
+                && scene.name == _pendingStartScene)
+            {
+                double initial = (!_speedrunMode.Value && _skipPrison1.Value) ? 38.470 : 0.0;
+                _rta.Reset(initial);
+                _igt.Reset(initial);
+                _rta.Start();
+                _igt.Start();
+                _runIsActive = true;
+                _waitingForLoadComplete = false;
+                _livesplitLastSplitScene = scene.name; // suppress split on the start scene
+                _lastSplitBuildIndex = scene.buildIndex; // splits only fire for higher level IDs
+                _pendingStartScene = null;
+                Logger.LogInfo($"[timer] run started on scene '{scene.name}' (initial offset {initial:F3}s)");
+                LiveSplitClient.StartTimer();
+                _livesplitNextSyncTime = 0f;
+            }
+
             // End-of-run check: stop both timers when credits load.
+            // Auto-split logic. SplitOnLevelChange fires once per distinct scene change
+            // during an active run, skipping the run-end scene (handled below). When that
+            // flag is off, fall back to the AutoSplitScenes whitelist.
+            if (_runIsActive && scene.name != _runEndScene.Value)
+            {
+                bool shouldSplit = false;
+                if (_livesplitSplitOnLevelChange != null && _livesplitSplitOnLevelChange.Value)
+                {
+                    if (_livesplitLastSplitScene != scene.name) shouldSplit = true;
+                }
+                else if (_livesplitSplitSceneList != null && _livesplitSplitSceneList.Length > 0)
+                {
+                    foreach (var trigger in _livesplitSplitSceneList)
+                    {
+                        if (string.IsNullOrEmpty(trigger)) continue;
+                        if (scene.name == trigger && _livesplitLastSplitScene != trigger)
+                        {
+                            shouldSplit = true;
+                            break;
+                        }
+                    }
+                }
+                // Level-ID guard: split only when the level ID (scene build index — the game
+                // orders levels by progression) strictly INCREASES. Replays, backtracks and
+                // restarts of already-split levels never split twice.
+                if (shouldSplit && scene.buildIndex <= _lastSplitBuildIndex)
+                {
+                    shouldSplit = false;
+                    Logger.LogInfo($"[splitguard] no split: '{scene.name}' id={scene.buildIndex} <= last split id={_lastSplitBuildIndex}");
+                }
+
+                // Save-load guard: a scene change caused by loading a save is not run
+                // progress — no split, even if it's the next level. The level-ID watermark
+                // still advances so the jumped-over levels can't split later either.
+                bool saveLoad = SaveLoadDetectPatch.IsActive();
+                try { saveLoad |= GameSaveScript.Loading; } catch { }
+                if (shouldSplit && saveLoad)
+                {
+                    shouldSplit = false;
+                    _livesplitLastSplitScene = scene.name;
+                    if (scene.buildIndex > _lastSplitBuildIndex) _lastSplitBuildIndex = scene.buildIndex;
+                    Logger.LogInfo($"[splitguard] no split: '{scene.name}' was reached by loading a save.");
+                }
+
+                if (shouldSplit)
+                {
+                    _livesplitLastSplitScene = scene.name;
+                    _lastSplitBuildIndex = scene.buildIndex;
+                    LiveSplitClient.Split();
+                    Logger.LogInfo($"[livesplit] split on scene '{scene.name}' (id={scene.buildIndex})");
+                }
+            }
+            SaveLoadDetectPatch.Clear();
+
             if (scene.name == _runEndScene.Value && _runIsActive)
             {
                 _rta.Stop();
                 _igt.Stop();
                 _runIsActive = false;
                 Logger.LogInfo($"[timer] run ended on scene '{scene.name}'. RTA={_rta.Format()} IGT={_igt.Format()}");
+                LiveSplitClient.SetGameTime(_igt.Elapsed); // final IGT push
+                LiveSplitClient.Split();
                 DumpRunConfigForModeration();
             }
         }
@@ -475,16 +627,14 @@ namespace RedAllianceSpeedrun
         {
             // Timer logic: if a TAB-triggered scene load is in progress, start timers once
             // the loading screen disappears (LoadingLevel returns to false).
-            if (_waitingForLoadComplete && !SceneManagerScript.LoadingLevel)
+            // Periodic IGT push to LiveSplit Server.
+            if (LiveSplitEnabled && _runIsActive && LiveSplitSyncRate > 0f)
             {
-                double initial = (!_speedrunMode.Value && _skipPrison1.Value) ? 38.470 : 0.0;
-                _rta.Reset(initial);
-                _igt.Reset(initial);
-                _rta.Start();
-                _igt.Start();
-                _runIsActive = true;
-                _waitingForLoadComplete = false;
-                Logger.LogInfo($"[timer] run started (initial offset {initial:F3}s)");
+                if (Time.unscaledTime >= _livesplitNextSyncTime)
+                {
+                    LiveSplitClient.SetGameTime(_igt.Elapsed);
+                    _livesplitNextSyncTime = Time.unscaledTime + (1f / LiveSplitSyncRate);
+                }
             }
 
             // Tick both timers with this frame's real elapsed time.
@@ -596,18 +746,59 @@ namespace RedAllianceSpeedrun
             _igt.Reset(initial);
             _waitingForLoadComplete = true;
             _runIsActive = false;
+            _livesplitLastSplitScene = null;
+            _lastSplitBuildIndex = -1;
+            _pendingStartScene = target;
+            LiveSplitClient.Reset();
+            if (_deleteSavesOnRestart != null && _deleteSavesOnRestart.Value)
+            {
+                DeleteSaveSlots();
+            }
 
             smgr.LoadLevel(target, 0f, false, Vector3.zero, Vector3.zero, loadType);
         }
 
         // Called by RaMenu before launching a level so timers behave the same as a TAB restart.
-        internal void PrepareTimersForLaunch()
+        internal void PrepareTimersForLaunch(string sceneName)
         {
             double initial = (!_speedrunMode.Value && _skipPrison1.Value) ? 38.470 : 0.0;
             _rta.Reset(initial);
             _igt.Reset(initial);
             _waitingForLoadComplete = true;
             _runIsActive = false;
+            _livesplitLastSplitScene = null;
+            _lastSplitBuildIndex = -1;
+            _pendingStartScene = sceneName;
+            LiveSplitClient.Reset();
+            if (_deleteSavesOnRestart != null && _deleteSavesOnRestart.Value)
+            {
+                DeleteSaveSlots();
+            }
+        }
+
+        // Deletes the save-slot files (including the vortex slot) so a pre-existing save
+        // can't be loaded mid-run to jump levels. Only red-alliance-*.cfg slots —
+        // gameData.cfg (settings, achievements, counters) is never touched.
+        private void DeleteSaveSlots()
+        {
+            try
+            {
+                string dir = System.IO.Path.GetFullPath("Assets\\SaveData");
+                if (!System.IO.Directory.Exists(dir)) return;
+                int deleted = 0;
+                string[] files = System.IO.Directory.GetFiles(dir, "red-alliance-*.cfg");
+                for (int i = 0; i < files.Length; i++)
+                {
+                    try { System.IO.File.Delete(files[i]); deleted++; }
+                    catch (Exception e) { Logger.LogWarning($"[savewipe] couldn't delete '{files[i]}': {e.Message}"); }
+                }
+                if (deleted > 0)
+                    Logger.LogInfo($"[savewipe] deleted {deleted} save slot(s) on restart (DeleteSavesOnRestart=true).");
+            }
+            catch (Exception e)
+            {
+                Logger.LogError("[savewipe] failed: " + e);
+            }
         }
 
         private void TryForceSave()

@@ -181,7 +181,7 @@ namespace RedAllianceSpeedrun
                     : LevelLoadingType.Transfer;
                 try { NetworkManager.OnStartedNewGame(); }
                 catch { /* may not be required for arbitrary loads */ }
-                Plugin.Instance?.PrepareTimersForLaunch();
+                Plugin.Instance?.PrepareTimersForLaunch(sceneName);
                 smgr.LoadLevel(sceneName, 0f, false, Vector3.zero, Vector3.zero, loadType);
                 Plugin.Logger.LogInfo($"[menu] launching '{sceneName}'");
                 _visible = false;
